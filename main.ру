@@ -1,0 +1,27 @@
+import telebot
+import random
+import os  # Модуль для работы с переменными хостинга
+
+# Хостинг сам вставит сюда токен из соображений безопасности
+TOKEN = os.environ.get('BOT_TOKEN')
+bot = telebot.TeleBot(TOKEN)
+
+GAV_VARIANTS = ["гав!", "гав?", "гав..."]
+user_counters = {}
+
+@bot.message_handler(func=lambda message: True)
+def count_messages(message):
+    user_id = message.from_user.id
+    
+    if user_id not in user_counters:
+        user_counters[user_id] = 0
+        
+    user_counters[user_id] += 1
+    
+    if user_counters[user_id] == 5:
+        random_gav = random.choice(GAV_VARIANTS)
+        bot.reply_to(message, random_gav)
+        user_counters[user_id] = 0
+
+# Запуск постоянной работы с защитой от сбоев
+bot.polling(none_stop=True, interval=0, timeout=20)
