@@ -7,7 +7,7 @@ import time
 from telebot import types
 from datetime import datetime, timedelta
 from urllib import request as urllib_request
-from keep_alive import keep_alive
+#from keep_alive import keep_alive
 from llama_cpp import Llama
 
 TOKEN = os.environ.get('BOT_TOKEN')
@@ -718,7 +718,7 @@ def preload_local_model():
         print(f"[local-ai preload error] {error}")
 
 if __name__ == "__main__":
-    keep_alive()
+    #keep_alive()
     ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
     ping_thread.start()
     model_thread = threading.Thread(target=preload_local_model, daemon=True)
