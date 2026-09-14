@@ -1,2 +1,4 @@
 pyTelegramBotAPI
+--extra-index-url https://pypi.org
 llama-cpp-python
+
