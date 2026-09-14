@@ -1,1 +1,2 @@
 pyTelegramBotAPI
+llama-cpp-python
