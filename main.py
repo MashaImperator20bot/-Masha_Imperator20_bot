@@ -5,13 +5,18 @@ import random
 import threading
 import time
 import traceback
-import requests
-from telebot import types
+from telebot import types, apihelper
 from datetime import datetime, timedelta
 from urllib import request as urllib_request
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from llama_cpp import Llama
 
 TOKEN = os.environ.get('BOT_TOKEN')
+
+# === ПРОКСИ (если Telegram блокируется на хостинге) ===
+# Если у тебя есть рабочий прокси, раскомментируй и замени ip:port
+# apihelper.proxy = {'https': 'socks5h://ip:port'}
+
 bot = telebot.TeleBot(TOKEN)
 
 BAD_WORDS_RAW = [
@@ -110,27 +115,13 @@ def normalize_text(text):
         return ""
     text = text.lower()
     text = re.sub(r'[\s\.\,\;\:\!\?\-\_\=\+\*\/\\\|\(\)\[\]\{\}\@\#\$\%\^\&\~\`\"\'«»„"<>]', '', text)
-    text = text.replace('0', 'о')
-    text = text.replace('1', 'и')
-    text = text.replace('3', 'е')
-    text = text.replace('4', 'а')
-    text = text.replace('5', 's')
-    text = text.replace('6', 'б')
-    text = text.replace('7', 'т')
-    text = text.replace('8', 'в')
-    text = text.replace('9', 'д')
-    text = text.replace('a', 'а')
-    text = text.replace('e', 'е')
-    text = text.replace('o', 'о')
-    text = text.replace('p', 'р')
-    text = text.replace('c', 'с')
-    text = text.replace('y', 'у')
-    text = text.replace('k', 'к')
-    text = text.replace('x', 'х')
-    text = text.replace('b', 'в')
-    text = text.replace('m', 'м')
-    text = text.replace('h', 'н')
-    text = text.replace('t', 'т')
+    text = text.replace('0', 'о').replace('1', 'и').replace('3', 'е')
+    text = text.replace('4', 'а').replace('5', 's').replace('6', 'б')
+    text = text.replace('7', 'т').replace('8', 'в').replace('9', 'д')
+    text = text.replace('a', 'а').replace('e', 'е').replace('o', 'о')
+    text = text.replace('p', 'р').replace('c', 'с').replace('y', 'у')
+    text = text.replace('k', 'к').replace('x', 'х').replace('b', 'в')
+    text = text.replace('m', 'м').replace('h', 'н').replace('t', 'т')
     text = re.sub(r'(.)\1+', r'\1', text)
     return text
 
@@ -147,25 +138,19 @@ def get_bot_identity_reply(text):
     normalized = re.sub(r"[?!.,:;«»\"']", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    if (
-        re.search(r"\bкак зовут\b", normalized)
-        or re.search(r"\bполное имя\b", normalized)
-        or re.search(r"\bкак тебя зовут\b", normalized)
-    ):
+    if (re.search(r"\bкак зовут\b", normalized)
+            or re.search(r"\bполное имя\b", normalized)
+            or re.search(r"\bкак тебя зовут\b", normalized)):
         return "Моё полное имя — Жилимаша, а сокращённо меня зовут Маша."
 
-    if (
-        re.search(r"\bгде (ты )?жив", normalized)
-        or re.search(r"\bоткуда ты\b", normalized)
-        or re.search(r"\bв какой стране\b", normalized)
-    ):
+    if (re.search(r"\bгде (ты )?жив", normalized)
+            or re.search(r"\bоткуда ты\b", normalized)
+            or re.search(r"\bв какой стране\b", normalized)):
         return "Я живу в России."
 
-    if (
-        re.search(r"\bкто (твой )?(хозяин|создатель|автор)\b", normalized)
-        or re.search(r"\bкто тебя создал\b", normalized)
-        or re.search(r"\bкто тебя придумал\b", normalized)
-    ):
+    if (re.search(r"\bкто (твой )?(хозяин|создатель|автор)\b", normalized)
+            or re.search(r"\bкто тебя создал\b", normalized)
+            or re.search(r"\bкто тебя придумал\b", normalized)):
         return "Мой создатель — крутой Макс."
 
     return None
@@ -176,54 +161,92 @@ def limit_sentences(text, n=3):
         return text.strip()
     return " ".join(p.strip() for p in parts[:n]).strip()
 
-def ask_keylessai(chat_id, system_prompt, user_text, max_tokens=48):
-    url = "https://keylessai.thryx.workers.dev/v1/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer not-needed"
-    }
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_text}
-    ]
-    payload = {
-        "model": "openai-fast",
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.6
-    }
+# ============================================================
+#  ЛОКАЛЬНАЯ НЕЙРОСЕТЬ (Gemma 3 270M, ленивая загрузка)
+# ============================================================
 
-    try:
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-        answer = data["choices"][0]["message"]["content"].strip()
+local_model = None
+local_model_lock = threading.Lock()
+local_generation_lock = threading.Lock()
 
-        if not answer:
-            raise RuntimeError("KeylessAI вернул пустой ответ.")
+LOCAL_MODEL_URL = (
+    "https://huggingface.co/Open4bits/gemma-3-270m-it-gguf/"
+    "resolve/main/gemma-3-270m-it-Q4_K_M.gguf?download=true"
+)
+LOCAL_MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "models",
+    "gemma-3-270m-it-Q4_K_M.gguf",
+)
 
-        answer = limit_sentences(answer, 3)
+def get_local_model():
+    global local_model
+    if local_model is not None:
+        return local_model
 
-        history = ai_histories.setdefault(chat_id, [])
-        history.extend([
-            {"role": "user", "content": user_text},
-            {"role": "assistant", "content": answer}
-        ])
-        del history[:-12]
+    with local_model_lock:
+        if local_model is not None:
+            return local_model
 
-        return answer
-    except requests.exceptions.Timeout:
-        raise RuntimeError("KeylessAI: превышено время ожидания.")
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"KeylessAI: ошибка сети — {e}")
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"KeylessAI: неожиданный формат ответа — {e}")
+        os.makedirs(os.path.dirname(LOCAL_MODEL_PATH), exist_ok=True)
+        if not os.path.exists(LOCAL_MODEL_PATH) or os.path.getsize(LOCAL_MODEL_PATH) < 10_000_000:
+            temp_path = f"{LOCAL_MODEL_PATH}.part"
+            try:
+                with urllib_request.urlopen(LOCAL_MODEL_URL, timeout=60) as response:
+                    with open(temp_path, "wb") as model_file:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            model_file.write(chunk)
+                os.replace(temp_path, LOCAL_MODEL_PATH)
+            except Exception as error:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise RuntimeError(f"Не удалось загрузить модель: {error}") from error
+
+        local_model = Llama(
+            model_path=LOCAL_MODEL_PATH,
+            n_ctx=512,
+            n_threads=2,
+            n_gpu_layers=0,
+            chat_format="chatml",
+            verbose=False,
+        )
+        return local_model
+
+def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
+    model = get_local_model()
+    history = ai_histories.setdefault(chat_id, [])
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history[-2:])
+    messages.append({"role": "user", "content": user_text})
+
+    with local_generation_lock:
+        result = model.create_chat_completion(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.6,
+            top_p=0.9,
+        )
+    answer = result["choices"][0]["message"]["content"].strip()
+    if not answer:
+        raise RuntimeError("Локальная модель вернула пустой ответ.")
+
+    answer = limit_sentences(answer, 3)
+
+    history.extend([
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": answer},
+    ])
+    del history[:-12]
+    return answer
 
 def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
-            answer = ask_keylessai(
+            answer = ask_local_model(
                 message.chat.id,
                 system_prompt,
                 user_text,
@@ -260,22 +283,12 @@ PHOTO_IDS = [
     "https://i.postimg.cc/Rhc2J69R/IMG-20260609-205259-0969.jpg"
 ]
 
-NORMAL_AVATAR_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "assets",
-    "bark_avatar.png",
-)
-LAWYER_AVATAR_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "assets",
-    "lawyer_avatar.jpg",
-)
+NORMAL_AVATAR_PATH = os.path.join(os.path.dirname(__file__), "assets", "bark_avatar.png")
+LAWYER_AVATAR_PATH = os.path.join(os.path.dirname(__file__), "assets", "lawyer_avatar.jpg")
 
 def set_bot_avatar(path):
     try:
-        bot.set_my_profile_photo(
-            types.InputProfilePhotoStatic(photo=types.InputFile(path))
-        )
+        bot.set_my_profile_photo(types.InputProfilePhotoStatic(photo=types.InputFile(path)))
         print(f"Аватар бота изменён: {os.path.basename(path)}")
         return True
     except Exception as error:
@@ -319,26 +332,21 @@ def set_manual_ban(message, duration_minutes):
     if message.chat.type not in ("group", "supergroup"):
         bot.reply_to(message, "❌ Эта команда работает только в группах.")
         return
-
     chat_id = message.chat.id
     last_message = last_messages.get(chat_id)
     if not last_message:
         bot.reply_to(message, "❌ Пока некому назначать удаление сообщений.")
         return
-
     target_user_id, target_message_id = last_message
     until_time = None if duration_minutes is None else datetime.now() + timedelta(minutes=duration_minutes)
-
     if chat_id not in muted_users:
         muted_users[chat_id] = {}
     muted_users[chat_id][target_user_id] = until_time
     last_banned_users[chat_id] = target_user_id
-
     try:
         bot.delete_message(chat_id, target_message_id)
     except:
         pass
-
     period = "навсегда" if duration_minutes is None else f"на {duration_minutes} мин."
     bot.reply_to(message, f"✅ Сообщения пользователя будут удаляться {period}.")
 
@@ -347,13 +355,11 @@ def exterminate_last_user(message):
     if not is_chat_admin(message):
         bot.reply_to(message, "❌ Эта команда доступна только администраторам чата.")
         return
-
     chat_id = message.chat.id
     last_message = last_messages.get(chat_id)
     if not last_message:
         bot.reply_to(message, "❌ Пока некому назначать удаление из группы.")
         return
-
     target_user_id, _ = last_message
     try:
         bot.ban_chat_member(chat_id, target_user_id, revoke_messages=True)
@@ -361,7 +367,6 @@ def exterminate_last_user(message):
             bot.unban_chat_member(chat_id, target_user_id, only_if_banned=True)
         except:
             pass
-
         if chat_id in muted_users:
             muted_users[chat_id].pop(target_user_id, None)
             if not muted_users[chat_id]:
@@ -369,11 +374,7 @@ def exterminate_last_user(message):
         last_banned_users.pop(chat_id, None)
         bot.reply_to(message, "✅ Пользователь удалён из группы.")
     except:
-        bot.reply_to(
-            message,
-            "❌ Не удалось удалить пользователя. Проверьте, что бот — администратор "
-            "с правом блокировки участников."
-        )
+        bot.reply_to(message, "❌ Не удалось удалить пользователя. Проверьте, что бот — администратор с правом блокировки участников.")
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/.")
 def toggle_self_destruct(message):
@@ -385,19 +386,14 @@ def toggle_self_destruct(message):
 def self_destruct_heretic(message):
     if not self_destruct_enabled.get(message.chat.id, False):
         return
-
     if message.chat.type not in ("group", "supergroup"):
         bot.reply_to(message, "❌ Эта команда работает только в группах.")
         return
-
     context_entries = chat_contexts.get(message.chat.id, [])
     if context_entries:
-        context_text = "\n".join(
-            f"{entry['name']}: {entry['text']}" for entry in context_entries[-6:]
-        )
+        context_text = "\n".join(f"{entry['name']}: {entry['text']}" for entry in context_entries[-6:])
     else:
         context_text = "Подробного контекста разговора нет."
-
     farewell_prompt = (
         "Напиши короткую философскую речь-прощание от Маши перед выходом из "
         "группы. Свяжи её с последними сообщениями разговора, но не упоминай "
@@ -406,30 +402,22 @@ def self_destruct_heretic(message):
         "Заверши мыслью о выборе между Императором и Хаосом в пользу Империума.\n\n"
         f"Последний контекст группы:\n{context_text[:1800]}"
     )
-
     try:
-        farewell = ask_keylessai(
+        farewell = ask_local_model(
             message.chat.id,
-            (
-                "Ты Маша — философский голос бота, который сейчас навсегда "
-                "покидает группу."
-            ),
+            "Ты Маша — философский голос бота, который сейчас навсегда покидает группу.",
             farewell_prompt,
             max_tokens=160,
         )
     except Exception as error:
         print(f"[farewell error] {error}")
-        farewell = (
-            "Каждая группа однажды подходит к границе, за которой слова "
-            "становятся выбором. Я ухожу, оставляя вам тишину для размышлений "
-            "и верность Императору и Империуму."
-        )
-
+        farewell = ("Каждая группа однажды подходит к границе, за которой слова "
+                    "становятся выбором. Я ухожу, оставляя вам тишину для размышлений "
+                    "и верность Императору и Империуму.")
     try:
         bot.send_message(message.chat.id, farewell)
     except Exception as error:
         print(f"[farewell send error] {error}")
-
     try:
         bot.leave_chat(message.chat.id)
     except Exception:
@@ -445,13 +433,11 @@ def perform_manual_unban(message):
     if not is_chat_admin(message):
         bot.reply_to(message, "❌ Эта команда доступна только администраторам чата.")
         return False
-
     chat_id = message.chat.id
     target_user_id = last_banned_users.get(chat_id)
     if target_user_id is None:
         bot.reply_to(message, "❌ Нет пользователя с активным удалением сообщений.")
         return False
-
     if chat_id in muted_users:
         muted_users[chat_id].pop(target_user_id, None)
         if not muted_users[chat_id]:
@@ -465,11 +451,9 @@ def handle_manual_unban(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
     used_by_users = used_unban_words.setdefault(chat_id, set())
-
     if user_id in used_by_users:
         bot.reply_to(message, "это слово временно не работает , напишите писюнец.")
         return
-
     if perform_manual_unban(message):
         used_by_users.add(user_id)
 
@@ -519,12 +503,10 @@ def toggle_lawyer_mode(message):
         ai_histories.pop(chat_id, None)
         bot.reply_to(message, random.choice(GAV_VARIANTS))
         return
-
     last_message = last_messages.get(chat_id)
     if not last_message:
         bot.reply_to(message, "❌ Не найден пользователь, написавший сообщение перед командой.")
         return
-
     protected_name, defender_name = get_lawyer_names(message)
     target_user_id, _ = last_message
     lawyer_profiles[chat_id] = {
@@ -537,23 +519,16 @@ def toggle_lawyer_mode(message):
     lawyer_avatar_chats.add(chat_id)
     update_lawyer_avatar()
     ai_histories.pop(chat_id, None)
-    bot.reply_to(
-        message,
-        f"⚖️ Режим юриста включён. Я жёстко защищаю "
-        f"{lawyer_profiles[chat_id]['protected_name']} и юридически разбираю "
-        f"аргументы {lawyer_profiles[chat_id]['defender_name']}.",
-    )
+    bot.reply_to(message, f"⚖️ Режим юриста включён. Я жёстко защищаю {lawyer_profiles[chat_id]['protected_name']} и юридически разбираю аргументы {lawyer_profiles[chat_id]['defender_name']}.")
 
 @bot.message_handler(commands=['мат+'])
 def enable_mat_filter(message):
-    chat_id = message.chat.id
-    mat_filter_enabled[chat_id] = True
+    mat_filter_enabled[message.chat.id] = True
     bot.reply_to(message, "✅ Мат-фильтр **включён**. Нарушители будут наказаны.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['мат-'])
 def disable_mat_filter(message):
-    chat_id = message.chat.id
-    mat_filter_enabled[chat_id] = False
+    mat_filter_enabled[message.chat.id] = False
     bot.reply_to(message, "❌ Мат-фильтр **отключён**. Все могут писать что угодно.", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda msg: True)
@@ -562,18 +537,11 @@ def count_messages(message):
     user_id = message.from_user.id
     if not is_moderation_command(message):
         last_messages[chat_id] = (user_id, message.message_id)
-        last_message_names[chat_id] = (
-            message.from_user.first_name
-            or message.from_user.username
-            or str(user_id)
-        )
+        last_message_names[chat_id] = (message.from_user.first_name or message.from_user.username or str(user_id))
         message_text = (message.text or message.caption or "").strip()
         if message_text:
             context_entries = chat_contexts.setdefault(chat_id, [])
-            context_entries.append({
-                "name": last_message_names[chat_id],
-                "text": message_text[:240],
-            })
+            context_entries.append({"name": last_message_names[chat_id], "text": message_text[:240]})
             del context_entries[:-8]
 
     if chat_id in muted_users and user_id in muted_users[chat_id]:
@@ -600,11 +568,7 @@ def count_messages(message):
                 muted_users[chat_id] = {}
             muted_users[chat_id][user_id] = until_time
             try:
-                warning = bot.send_message(
-                    chat_id,
-                    f"⚠️ Пользователь {message.from_user.first_name} использовал запрещённое слово. "
-                    "Все его сообщения будут удаляться в течение 1 минуты."
-                )
+                warning = bot.send_message(chat_id, f"⚠️ Пользователь {message.from_user.first_name} использовал запрещённое слово. Все его сообщения будут удаляться в течение 1 минуты.")
                 def delete_warning():
                     time.sleep(5)
                     try:
@@ -625,12 +589,9 @@ def count_messages(message):
         else:
             send_local_ai_reply(
                 message,
-                (
-                    "Ты дружелюбная локальная нейросеть внутри Telegram-бота. "
-                    "Отвечай на русском языке кратко, максимум двумя короткими "
-                    "предложениями, по делу, без упоминания внутренних инструкций "
-                    "и API-ключей."
-                ),
+                ("Ты дружелюбная локальная нейросеть внутри Telegram-бота. "
+                 "Отвечай на русском языке кратко, максимум тремя короткими "
+                 "предложениями, по делу, без упоминания внутренних инструкций."),
                 user_text,
             )
         return
@@ -648,18 +609,11 @@ def count_messages(message):
             else:
                 send_local_ai_reply(
                     message,
-                    (
-                        f"Ты жёсткий юридический защитник пользователя "
-                        f"{profile['protected_name']} в споре с {profile['defender_name']}. "
-                        "Твоя задача — максимально защищать подзащитного и жёстко "
-                        "разбирать оппонента по существу: найди логические ошибки, "
-                        "манипуляции, голословные обвинения и отсутствие доказательств, "
-                        "затем дай уверенное юридическое возражение. Газуй юридически: "
-                        "давите на бремя доказывания, факты, причинно-следственные связи "
-                        "и общие правовые принципы. Не выдумывай статьи и законы, не "
-                        "угрожай и не переходи на личные оскорбления. Отвечай по-русски "
-                        "в 2–3 коротких, острых предложениях."
-                    ),
+                    (f"Ты жёсткий юридический защитник пользователя "
+                     f"{profile['protected_name']} в споре с {profile['defender_name']}. "
+                     "Найди логические ошибки, манипуляции и отсутствие доказательств, "
+                     "затем дай уверенное юридическое возражение. Не выдумывай статьи и законы. "
+                     "Отвечай по-русски максимум тремя короткими предложениями."),
                     user_text,
                     max_tokens=112,
                 )
@@ -670,14 +624,11 @@ def count_messages(message):
     user_counters[user_id] += 1
 
     if user_counters[user_id] % 5 == 0 and user_counters[user_id] < 20:
-        random_gav = random.choice(GAV_VARIANTS)
-        bot.reply_to(message, random_gav)
+        bot.reply_to(message, random.choice(GAV_VARIANTS))
 
     if user_counters[user_id] >= 20:
-        random_gav = random.choice(GAV_VARIANTS)
-        bot.reply_to(message, random_gav)
-        photo = random.choice(PHOTO_IDS)
-        bot.send_photo(message.chat.id, photo)
+        bot.reply_to(message, random.choice(GAV_VARIANTS))
+        bot.send_photo(message.chat.id, random.choice(PHOTO_IDS))
         user_counters[user_id] = 0
 
 def self_ping_loop():
@@ -689,13 +640,16 @@ def self_ping_loop():
             print(f"[self-ping error] {e}")
         time.sleep(180)
 
+def preload_local_model():
+    # Автозагрузка отключена, чтобы не крашить контейнер по OOM при старте.
+    print("Автозагрузка модели отключена. Модель загрузится при первом запросе.")
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
-
     def log_message(self, format, *args):
         pass
 
@@ -722,9 +676,7 @@ def run_bot():
 if __name__ == "__main__":
     health_thread = threading.Thread(target=run_health_check, daemon=True)
     health_thread.start()
-
     ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
     ping_thread.start()
-
     print("Бот запущен...")
     run_bot()
