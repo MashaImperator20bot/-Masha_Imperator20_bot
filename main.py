@@ -176,31 +176,31 @@ def limit_sentences(text, n=3):
         return text.strip()
     return " ".join(p.strip() for p in parts[:n]).strip()
 
-def ask_danyapi(chat_id, system_prompt, user_text, max_tokens=48):
-    url = "https://danyapi.cloudpub.ru/v1/chat/completions"
+def ask_keylessai(chat_id, system_prompt, user_text, max_tokens=48):
+    url = "https://keylessai.thryx.workers.dev/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer dummy-key"
+        "Authorization": "Bearer not-needed"
     }
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text}
     ]
     payload = {
-        "model": "deepseek-chat",
+        "model": "openai-fast",
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.6
     }
 
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         data = response.json()
         answer = data["choices"][0]["message"]["content"].strip()
 
         if not answer:
-            raise RuntimeError("API вернул пустой ответ.")
+            raise RuntimeError("KeylessAI вернул пустой ответ.")
 
         answer = limit_sentences(answer, 3)
 
@@ -213,17 +213,17 @@ def ask_danyapi(chat_id, system_prompt, user_text, max_tokens=48):
 
         return answer
     except requests.exceptions.Timeout:
-        raise RuntimeError("DanyAPI: превышено время ожидания.")
+        raise RuntimeError("KeylessAI: превышено время ожидания.")
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"DanyAPI: ошибка сети — {e}")
+        raise RuntimeError(f"KeylessAI: ошибка сети — {e}")
     except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"DanyAPI: неожиданный формат ответа — {e}")
+        raise RuntimeError(f"KeylessAI: неожиданный формат ответа — {e}")
 
 def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
-            answer = ask_danyapi(
+            answer = ask_keylessai(
                 message.chat.id,
                 system_prompt,
                 user_text,
@@ -408,7 +408,7 @@ def self_destruct_heretic(message):
     )
 
     try:
-        farewell = ask_danyapi(
+        farewell = ask_keylessai(
             message.chat.id,
             (
                 "Ты Маша — философский голос бота, который сейчас навсегда "
