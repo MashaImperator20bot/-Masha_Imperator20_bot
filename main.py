@@ -5,12 +5,11 @@ import random
 import threading
 import time
 import traceback
+import requests
 from telebot import types
 from datetime import datetime, timedelta
 from urllib import request as urllib_request
 from http.server import BaseHTTPRequestHandler, HTTPServer
-#from keep_alive import keep_alive
-from llama_cpp import Llama
 
 TOKEN = os.environ.get('BOT_TOKEN')
 bot = telebot.TeleBot(TOKEN)
@@ -177,74 +176,51 @@ def limit_sentences(text, n=3):
         return text.strip()
     return " ".join(p.strip() for p in parts[:n]).strip()
 
-def get_local_model():
-    global local_model
-    if local_model is not None:
-        return local_model
+def ask_pollinations(chat_id, system_prompt, user_text, max_tokens=48):
+    url = "https://text.pollinations.ai/openai"
+    headers = {"Content-Type": "application/json"}
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text}
+    ]
+    payload = {
+        "model": "openai",
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": 0.6
+    }
 
-    with local_model_lock:
-        if local_model is not None:
-            return local_model
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        answer = data["choices"][0]["message"]["content"].strip()
 
-        os.makedirs(os.path.dirname(LOCAL_MODEL_PATH), exist_ok=True)
-        if not os.path.exists(LOCAL_MODEL_PATH) or os.path.getsize(LOCAL_MODEL_PATH) < 10_000_000:
-            temp_path = f"{LOCAL_MODEL_PATH}.part"
-            try:
-                with urllib_request.urlopen(LOCAL_MODEL_URL, timeout=30) as response:
-                    with open(temp_path, "wb") as model_file:
-                        while True:
-                            chunk = response.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            model_file.write(chunk)
-                os.replace(temp_path, LOCAL_MODEL_PATH)
-            except Exception as error:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                raise RuntimeError(f"Не удалось загрузить локальную модель: {error}") from error
+        if not answer:
+            raise RuntimeError("API вернул пустой ответ.")
 
-        local_model = Llama(
-            model_path=LOCAL_MODEL_PATH,
-            n_ctx=2048,
-            n_threads=max(1, (os.cpu_count() or 2) - 1),
-            n_gpu_layers=0,
-            chat_format="chatml",
-            verbose=False,
-        )
-        return local_model
+        answer = limit_sentences(answer, 3)
 
-def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
-    model = get_local_model()
-    history = ai_histories.setdefault(chat_id, [])
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-2:])
-    messages.append({"role": "user", "content": user_text})
+        history = ai_histories.setdefault(chat_id, [])
+        history.extend([
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": answer}
+        ])
+        del history[:-12]
 
-    with local_generation_lock:
-        result = model.create_chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.6,
-            top_p=0.9,
-        )
-    answer = result["choices"][0]["message"]["content"].strip()
-    if not answer:
-        raise RuntimeError("Локальная модель вернула пустой ответ.")
-
-    answer = limit_sentences(answer, 3)
-
-    history.extend([
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": answer},
-    ])
-    del history[:-12]
-    return answer
+        return answer
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Pollinations API: превышено время ожидания.")
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Pollinations API: ошибка сети — {e}")
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Pollinations API: неожиданный формат ответа — {e}")
 
 def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
-            answer = ask_local_model(
+            answer = ask_pollinations(
                 message.chat.id,
                 system_prompt,
                 user_text,
@@ -253,7 +229,7 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
             bot.reply_to(message, answer)
         except Exception as error:
             tb = traceback.format_exc()
-            print(f"[local-ai error] {error}\n{tb}")
+            print(f"[ai error] {error}\n{tb}")
             short = f"{type(error).__name__}: {error}"[:900]
             try:
                 bot.reply_to(message, f"⚠️ Ошибка нейросети:\n{short}")
@@ -274,19 +250,6 @@ lawyer_profiles = {}
 lawyer_avatar_chats = set()
 ai_histories = {}
 self_destruct_enabled = {}
-local_model = None
-local_model_lock = threading.Lock()
-local_generation_lock = threading.Lock()
-
-LOCAL_MODEL_URL = (
-    "https://huggingface.co/HackNetAyush/smollm2-135M-instruct-gguf-q8/"
-    "resolve/main/smollm2-135m-instruct-q8_0.gguf?download=true"
-)
-LOCAL_MODEL_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "models",
-    "smollm2-135m-instruct-q8_0.gguf",
-)
 
 GAV_VARIANTS = ["гав!", "гав?", "(довольный) гав", "Ррррр!", "ГАВ", "(веселый) гав", "гав..."]
 
@@ -442,7 +405,7 @@ def self_destruct_heretic(message):
     )
 
     try:
-        farewell = ask_local_model(
+        farewell = ask_pollinations(
             message.chat.id,
             (
                 "Ты Маша — философский голос бота, который сейчас навсегда "
@@ -723,13 +686,6 @@ def self_ping_loop():
             print(f"[self-ping error] {e}")
         time.sleep(180)
 
-def preload_local_model():
-    try:
-        get_local_model()
-        print("Локальная модель загружена.")
-    except Exception as error:
-        print(f"[local-ai preload error] {error}")
-
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -742,9 +698,14 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def run_health_check():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    print(f"Health-check сервер запущен на порту {port}")
-    server.serve_forever()
+    while True:
+        try:
+            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+            print(f"Health-check сервер запущен на порту {port}")
+            server.serve_forever()
+        except Exception as error:
+            print(f"[health error] {error}")
+            time.sleep(5)
 
 def run_bot():
     while True:
@@ -756,13 +717,11 @@ def run_bot():
             time.sleep(15)
 
 if __name__ == "__main__":
-    #keep_alive()
     health_thread = threading.Thread(target=run_health_check, daemon=True)
     health_thread.start()
 
     ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
     ping_thread.start()
-    model_thread = threading.Thread(target=preload_local_model, daemon=True)
-    model_thread.start()
+
     print("Бот запущен...")
     run_bot()
