@@ -176,15 +176,18 @@ def limit_sentences(text, n=3):
         return text.strip()
     return " ".join(p.strip() for p in parts[:n]).strip()
 
-def ask_pollinations(chat_id, system_prompt, user_text, max_tokens=48):
-    url = "https://text.pollinations.ai/openai"
-    headers = {"Content-Type": "application/json"}
+def ask_danyapi(chat_id, system_prompt, user_text, max_tokens=48):
+    url = "https://danyapi.cloudpub.ru/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer dummy-key"
+    }
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text}
     ]
     payload = {
-        "model": "openai",
+        "model": "deepseek-chat",
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": 0.6
@@ -210,17 +213,17 @@ def ask_pollinations(chat_id, system_prompt, user_text, max_tokens=48):
 
         return answer
     except requests.exceptions.Timeout:
-        raise RuntimeError("Pollinations API: превышено время ожидания.")
+        raise RuntimeError("DanyAPI: превышено время ожидания.")
     except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Pollinations API: ошибка сети — {e}")
+        raise RuntimeError(f"DanyAPI: ошибка сети — {e}")
     except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Pollinations API: неожиданный формат ответа — {e}")
+        raise RuntimeError(f"DanyAPI: неожиданный формат ответа — {e}")
 
 def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
-            answer = ask_pollinations(
+            answer = ask_danyapi(
                 message.chat.id,
                 system_prompt,
                 user_text,
@@ -405,7 +408,7 @@ def self_destruct_heretic(message):
     )
 
     try:
-        farewell = ask_pollinations(
+        farewell = ask_danyapi(
             message.chat.id,
             (
                 "Ты Маша — философский голос бота, который сейчас навсегда "
