@@ -191,7 +191,7 @@ def ask_imitation(user_text):
     ])
 
 # ============================================================
-#  ЛОКАЛЬНАЯ НЕЙРОСЕТЬ (Gemma 3 270M, быстрые параметры)
+#  ЛОКАЛЬНАЯ НЕЙРОСЕТЬ (Gemma 3 270M)
 # ============================================================
 
 local_model = None
@@ -243,10 +243,10 @@ def get_local_model():
             from llama_cpp import Llama
             local_model = Llama(
                 model_path=LOCAL_MODEL_PATH,
-                n_ctx=256,           # было 512 → быстрее
-                n_threads=2,
+                n_ctx=128,
+                n_threads=1,
                 n_gpu_layers=0,
-                chat_format="gemma", # правильный формат для Gemma 3
+                chat_format="gemma",
                 verbose=False,
             )
             print("[model] Модель загружена успешно.")
@@ -256,15 +256,19 @@ def get_local_model():
             model_failed = True
             return None
 
-def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):  # было 48
+def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):
+    global local_model, model_failed
     model = get_local_model()
     if model is None:
         return ask_imitation(user_text)
 
-    history = ai_histories.setdefault(chat_id, [])
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-2:])
-    messages.append({"role": "user", "content": user_text})
+    system_trimmed = (system_prompt or "")[:120]
+    user_trimmed = (user_text or "")[:120]
+
+    messages = [
+        {"role": "system", "content": system_trimmed},
+        {"role": "user", "content": user_trimmed},
+    ]
 
     try:
         with local_generation_lock:
@@ -277,18 +281,17 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):  # был
         answer = result["choices"][0]["message"]["content"].strip()
         if not answer:
             return ask_imitation(user_text)
-        answer = limit_sentences(answer, 2)
-        history.extend([
-            {"role": "user", "content": user_text},
-            {"role": "assistant", "content": answer},
-        ])
-        del history[:-12]
-        return answer
+        return limit_sentences(answer, 2)
     except Exception as error:
         print(f"[model generation error] {error}")
+        model_failed = True
+        try:
+            local_model = None
+        except Exception:
+            pass
         return ask_imitation(user_text)
 
-def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):  # было 48
+def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
