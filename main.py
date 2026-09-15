@@ -4,6 +4,7 @@ import telebot
 import random
 import threading
 import time
+import traceback
 from telebot import types
 from datetime import datetime, timedelta
 from urllib import request as urllib_request
@@ -207,6 +208,7 @@ def get_local_model():
             n_ctx=2048,
             n_threads=max(1, (os.cpu_count() or 2) - 1),
             n_gpu_layers=0,
+            chat_format="chatml",
             verbose=False,
         )
         return local_model
@@ -224,7 +226,6 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
             max_tokens=max_tokens,
             temperature=0.6,
             top_p=0.9,
-            stop=["\n\n", "User:", "Пользователь:"],
         )
     answer = result["choices"][0]["message"]["content"].strip()
     if not answer:
@@ -251,11 +252,13 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
             )
             bot.reply_to(message, answer)
         except Exception as error:
-            print(f"[local-ai error] {error}")
-            bot.reply_to(
-                message,
-                "Локальная нейросеть пока не готова. Попробуйте повторить сообщение через минуту.",
-            )
+            tb = traceback.format_exc()
+            print(f"[local-ai error] {error}\n{tb}")
+            short = f"{type(error).__name__}: {error}"[:900]
+            try:
+                bot.reply_to(message, f"⚠️ Ошибка нейросети:\n{short}")
+            except Exception:
+                pass
 
     threading.Thread(target=generate_reply, daemon=True).start()
 
@@ -276,13 +279,13 @@ local_model_lock = threading.Lock()
 local_generation_lock = threading.Lock()
 
 LOCAL_MODEL_URL = (
-    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/"
-    "resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true"
+    "https://huggingface.co/HackNetAyush/smollm2-135M-instruct-gguf-q8/"
+    "resolve/main/smollm2-135m-instruct-q8_0.gguf?download=true"
 )
 LOCAL_MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
     "models",
-    "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "smollm2-135m-instruct-q8_0.gguf",
 )
 
 GAV_VARIANTS = ["гав!", "гав?", "(довольный) гав", "Ррррр!", "ГАВ", "(веселый) гав", "гав..."]
@@ -743,6 +746,15 @@ def run_health_check():
     print(f"Health-check сервер запущен на порту {port}")
     server.serve_forever()
 
+def run_bot():
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as error:
+            print(f"[polling error] {error}")
+            traceback.print_exc()
+            time.sleep(15)
+
 if __name__ == "__main__":
     #keep_alive()
     health_thread = threading.Thread(target=run_health_check, daemon=True)
@@ -753,4 +765,4 @@ if __name__ == "__main__":
     model_thread = threading.Thread(target=preload_local_model, daemon=True)
     model_thread.start()
     print("Бот запущен...")
-    bot.infinity_polling()
+    run_bot()
