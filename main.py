@@ -152,7 +152,7 @@ def limit_sentences(text, n=3):
     return " ".join(p.strip() for p in parts[:n]).strip()
 
 # ============================================================
-#  FALLBACK-ИМИТАЦИЯ (работает всегда, не требует модели)
+#  FALLBACK-ИМИТАЦИЯ
 # ============================================================
 
 FALLBACK_RESPONSES = {
@@ -171,20 +171,10 @@ FALLBACK_RESPONSES = {
         "Я бот-помощник. Меня зовут Маша.",
         "Я искусственный интеллект.",
     ],
-    ("спасибо", "благодарю", "спс"): [
-        "Пожалуйста!",
-        "Всегда рада помочь!",
-        "Обращайся!",
-    ],
-    ("пока", "до свидания", "бай"): [
-        "Пока! Возвращайся.",
-        "До встречи!",
-        "Всего доброго!",
-    ],
+    ("спасибо", "благодарю", "спс"): ["Пожалуйста!", "Всегда рада помочь!", "Обращайся!"],
+    ("пока", "до свидания", "бай"): ["Пока! Возвращайся.", "До встречи!", "Всего доброго!"],
     ("почему", "зачем", "как", "что", "где", "когда"): [
-        "Интересный вопрос.",
-        "Дай подумать...",
-        "Это зависит от многого.",
+        "Интересный вопрос.", "Дай подумать...", "Это зависит от многого.",
     ],
 }
 
@@ -201,7 +191,7 @@ def ask_imitation(user_text):
     ])
 
 # ============================================================
-#  ЛОКАЛЬНАЯ НЕЙРОСЕТЬ (Gemma 3 270M, ленивая загрузка, безопасно)
+#  ЛОКАЛЬНАЯ НЕЙРОСЕТЬ (Gemma 3 270M, быстрые параметры)
 # ============================================================
 
 local_model = None
@@ -253,10 +243,10 @@ def get_local_model():
             from llama_cpp import Llama
             local_model = Llama(
                 model_path=LOCAL_MODEL_PATH,
-                n_ctx=512,
+                n_ctx=256,           # было 512 → быстрее
                 n_threads=2,
                 n_gpu_layers=0,
-                chat_format="chatml",
+                chat_format="gemma", # правильный формат для Gemma 3
                 verbose=False,
             )
             print("[model] Модель загружена успешно.")
@@ -266,7 +256,7 @@ def get_local_model():
             model_failed = True
             return None
 
-def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
+def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):  # было 48
     model = get_local_model()
     if model is None:
         return ask_imitation(user_text)
@@ -287,7 +277,7 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
         answer = result["choices"][0]["message"]["content"].strip()
         if not answer:
             return ask_imitation(user_text)
-        answer = limit_sentences(answer, 3)
+        answer = limit_sentences(answer, 2)
         history.extend([
             {"role": "user", "content": user_text},
             {"role": "assistant", "content": answer},
@@ -298,13 +288,12 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
         print(f"[model generation error] {error}")
         return ask_imitation(user_text)
 
-def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
+def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):  # было 48
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
         except Exception:
             pass
-
         try:
             answer = ask_local_model(
                 message.chat.id,
@@ -470,7 +459,7 @@ def self_destruct_heretic(message):
                 message.chat.id,
                 "Ты Маша — философский голос бота.",
                 farewell_prompt,
-                max_tokens=160,
+                max_tokens=60,
             )
         except Exception:
             farewell = ("Каждая группа однажды подходит к границе, за которой слова "
@@ -672,7 +661,7 @@ def count_messages(message):
             else:
                 send_local_ai_reply(
                     message,
-                    ("Ты дружелюбная нейросеть. Отвечай на русском, максимум тремя короткими предложениями."),
+                    ("Ты дружелюбная нейросеть. Отвечай на русском, максимум двумя короткими предложениями."),
                     user_text,
                 )
             return
@@ -690,9 +679,9 @@ def count_messages(message):
                 else:
                     send_local_ai_reply(
                         message,
-                        (f"Ты жёсткий юридический защитник. Отвечай по-русски максимум тремя предложениями."),
+                        (f"Ты жёсткий юридический защитник. Отвечай по-русски максимум двумя предложениями."),
                         user_text,
-                        max_tokens=112,
+                        max_tokens=30,
                     )
             return
 
