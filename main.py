@@ -7,6 +7,7 @@ import time
 from telebot import types
 from datetime import datetime, timedelta
 from urllib import request as urllib_request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 #from keep_alive import keep_alive
 from llama_cpp import Llama
 
@@ -726,8 +727,27 @@ def preload_local_model():
     except Exception as error:
         print(f"[local-ai preload error] {error}")
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+def run_health_check():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"Health-check сервер запущен на порту {port}")
+    server.serve_forever()
+
 if __name__ == "__main__":
     #keep_alive()
+    health_thread = threading.Thread(target=run_health_check, daemon=True)
+    health_thread.start()
+
     ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
     ping_thread.start()
     model_thread = threading.Thread(target=preload_local_model, daemon=True)
