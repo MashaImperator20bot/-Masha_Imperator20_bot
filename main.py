@@ -14,7 +14,6 @@ from llama_cpp import Llama
 TOKEN = os.environ.get('BOT_TOKEN')
 
 # === ПРОКСИ (если Telegram блокируется на хостинге) ===
-# Если у тебя есть рабочий прокси, раскомментируй и замени ip:port
 # apihelper.proxy = {'https': 'socks5h://ip:port'}
 
 bot = telebot.TeleBot(TOKEN)
@@ -203,16 +202,20 @@ def get_local_model():
             except Exception as error:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
-                raise RuntimeError(f"Не удалось загрузить модель: {error}") from error
+                raise RuntimeError(f"Не удалось скачать модель: {error}") from error
 
-        local_model = Llama(
-            model_path=LOCAL_MODEL_PATH,
-            n_ctx=512,
-            n_threads=2,
-            n_gpu_layers=0,
-            chat_format="chatml",
-            verbose=False,
-        )
+        try:
+            local_model = Llama(
+                model_path=LOCAL_MODEL_PATH,
+                n_ctx=512,
+                n_threads=2,
+                n_gpu_layers=0,
+                chat_format="chatml",
+                verbose=False,
+            )
+        except Exception as error:
+            raise RuntimeError(f"Не удалось загрузить модель в RAM: {error}") from error
+
         return local_model
 
 def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
@@ -231,7 +234,7 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
         )
     answer = result["choices"][0]["message"]["content"].strip()
     if not answer:
-        raise RuntimeError("Локальная модель вернула пустой ответ.")
+        raise RuntimeError("Модель вернула пустой ответ.")
 
     answer = limit_sentences(answer, 3)
 
@@ -246,12 +249,24 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
+
+            # Отдельно ловим ошибку загрузки модели
+            try:
+                get_local_model()
+            except Exception as load_error:
+                short = f"{type(load_error).__name__}: {load_error}"[:900]
+                bot.reply_to(message, f"❌ Ошибка загрузки модели:\n{short}")
+                return
+
             answer = ask_local_model(
                 message.chat.id,
                 system_prompt,
                 user_text,
                 max_tokens=max_tokens,
             )
+            if not answer or not answer.strip():
+                bot.reply_to(message, "⚠️ Модель вернула пустой ответ.")
+                return
             bot.reply_to(message, answer)
         except Exception as error:
             tb = traceback.format_exc()
@@ -259,8 +274,8 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
             short = f"{type(error).__name__}: {error}"[:900]
             try:
                 bot.reply_to(message, f"⚠️ Ошибка нейросети:\n{short}")
-            except Exception:
-                pass
+            except Exception as send_err:
+                print(f"[send error] {send_err}")
 
     threading.Thread(target=generate_reply, daemon=True).start()
 
@@ -641,7 +656,6 @@ def self_ping_loop():
         time.sleep(180)
 
 def preload_local_model():
-    # Автозагрузка отключена, чтобы не крашить контейнер по OOM при старте.
     print("Автозагрузка модели отключена. Модель загрузится при первом запросе.")
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
