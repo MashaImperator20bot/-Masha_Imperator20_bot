@@ -169,6 +169,12 @@ def get_bot_identity_reply(text):
 
     return None
 
+def limit_sentences(text, n=3):
+    parts = re.findall(r'[^.!?…]+[.!?…]+', text)
+    if not parts:
+        return text.strip()
+    return " ".join(p.strip() for p in parts[:n]).strip()
+
 def get_local_model():
     global local_model
     if local_model is not None:
@@ -204,7 +210,7 @@ def get_local_model():
         )
         return local_model
 
-def ask_local_model(chat_id, system_prompt, user_text, max_tokens=96):
+def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
     model = get_local_model()
     history = ai_histories.setdefault(chat_id, [])
     messages = [{"role": "system", "content": system_prompt}]
@@ -217,10 +223,13 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=96):
             max_tokens=max_tokens,
             temperature=0.6,
             top_p=0.9,
+            stop=["\n\n", "User:", "Пользователь:"],
         )
     answer = result["choices"][0]["message"]["content"].strip()
     if not answer:
         raise RuntimeError("Локальная модель вернула пустой ответ.")
+
+    answer = limit_sentences(answer, 3)
 
     history.extend([
         {"role": "user", "content": user_text},
@@ -229,7 +238,7 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=96):
     del history[:-12]
     return answer
 
-def send_local_ai_reply(message, system_prompt, user_text, max_tokens=96):
+def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
@@ -266,13 +275,13 @@ local_model_lock = threading.Lock()
 local_generation_lock = threading.Lock()
 
 LOCAL_MODEL_URL = (
-    "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/"
-    "resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf?download=true"
+    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/"
+    "resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true"
 )
 LOCAL_MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
     "models",
-    "qwen2.5-3b-instruct-q4_k_m.gguf",
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf",
 )
 
 GAV_VARIANTS = ["гав!", "гав?", "(довольный) гав", "Ррррр!", "ГАВ", "(веселый) гав", "гав..."]
