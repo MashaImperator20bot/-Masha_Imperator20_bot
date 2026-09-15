@@ -5,6 +5,8 @@ import random
 import threading
 import time
 import traceback
+import multiprocessing as mp
+from queue import Empty
 from telebot import types
 from datetime import datetime, timedelta
 from urllib import request as urllib_request
@@ -191,105 +193,208 @@ def ask_imitation(user_text):
     ])
 
 # ============================================================
-#  ЛОКАЛЬНАЯ НЕЙРОСЕТЬ (Gemma 3 270M)
+#  ВОРКЕР МОДЕЛИ (отдельный процесс — краш не убивает бота)
 # ============================================================
 
-local_model = None
-local_model_lock = threading.Lock()
-local_generation_lock = threading.Lock()
-model_failed = False
-
 LOCAL_MODEL_URL = (
-    "https://huggingface.co/Open4bits/gemma-3-270m-it-gguf/"
-    "resolve/main/gemma-3-270m-it-Q4_K_M.gguf?download=true"
+    "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct-GGUF/"
+    "resolve/main/smollm2-135m-instruct-q4_k_m.gguf?download=true"
 )
 LOCAL_MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
     "models",
-    "gemma-3-270m-it-Q4_K_M.gguf",
+    "smollm2-135m-instruct-q4_k_m.gguf",
 )
 
-def get_local_model():
-    global local_model, model_failed
-    if local_model is not None:
-        return local_model
-    if model_failed:
-        return None
-
-    with local_model_lock:
-        if local_model is not None:
-            return local_model
-        if model_failed:
-            return None
-
-        try:
-            os.makedirs(os.path.dirname(LOCAL_MODEL_PATH), exist_ok=True)
-            if not os.path.exists(LOCAL_MODEL_PATH) or os.path.getsize(LOCAL_MODEL_PATH) < 10_000_000:
-                temp_path = f"{LOCAL_MODEL_PATH}.part"
-                try:
-                    with urllib_request.urlopen(LOCAL_MODEL_URL, timeout=60) as response:
-                        with open(temp_path, "wb") as model_file:
-                            while True:
-                                chunk = response.read(1024 * 1024)
-                                if not chunk:
-                                    break
-                                model_file.write(chunk)
-                    os.replace(temp_path, LOCAL_MODEL_PATH)
-                except Exception as error:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                    raise RuntimeError(f"Не удалось скачать модель: {error}") from error
-
-            from llama_cpp import Llama
-            local_model = Llama(
-                model_path=LOCAL_MODEL_PATH,
-                n_ctx=128,
-                n_threads=1,
-                n_gpu_layers=0,
-                chat_format="gemma",
-                verbose=False,
-            )
-            print("[model] Модель загружена успешно.")
-            return local_model
-        except Exception as error:
-            print(f"[model] Не удалось загрузить модель: {error}")
-            model_failed = True
-            return None
-
-def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):
-    global local_model, model_failed
-    model = get_local_model()
-    if model is None:
-        return ask_imitation(user_text)
-
-    system_trimmed = (system_prompt or "")[:120]
-    user_trimmed = (user_text or "")[:120]
-
-    messages = [
-        {"role": "system", "content": system_trimmed},
-        {"role": "user", "content": user_trimmed},
-    ]
-
+def model_worker(req_q, resp_q):
+    """Работает в ОТДЕЛЬНОМ процессе. Если упадёт — убьёт только себя."""
     try:
-        with local_generation_lock:
-            result = model.create_chat_completion(
+        os.makedirs(os.path.dirname(LOCAL_MODEL_PATH), exist_ok=True)
+        if not os.path.exists(LOCAL_MODEL_PATH) or os.path.getsize(LOCAL_MODEL_PATH) < 10_000_000:
+            temp_path = f"{LOCAL_MODEL_PATH}.part"
+            with urllib_request.urlopen(LOCAL_MODEL_URL, timeout=60) as response:
+                with open(temp_path, "wb") as f:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            os.replace(temp_path, LOCAL_MODEL_PATH)
+
+        from llama_cpp import Llama
+        llm = Llama(
+            model_path=LOCAL_MODEL_PATH,
+            n_ctx=128,
+            n_threads=2,
+            n_gpu_layers=0,
+            chat_format="chatml",
+            verbose=False,
+        )
+    except Exception as e:
+        resp_q.put(("init_error", str(e)))
+        return
+
+    resp_q.put(("ready", None))
+
+    while True:
+        try:
+            req = req_q.get()
+        except (EOFError, OSError):
+            break
+        if req is None:
+            break
+        try:
+            system_prompt, user_text, max_tokens = req
+            messages = [
+                {"role": "system", "content": (system_prompt or "")[:120]},
+                {"role": "user", "content": (user_text or "")[:120]},
+            ]
+            result = llm.create_chat_completion(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.6,
                 top_p=0.9,
             )
-        answer = result["choices"][0]["message"]["content"].strip()
-        if not answer:
-            return ask_imitation(user_text)
-        return limit_sentences(answer, 2)
-    except Exception as error:
-        print(f"[model generation error] {error}")
-        model_failed = True
+            answer = result["choices"][0]["message"]["content"].strip()
+            resp_q.put(("ok", answer))
+        except Exception as e:
+            resp_q.put(("gen_error", str(e)))
+
+# ============================================================
+#  МЕНЕДЖЕР ВОРКЕРА (в главном процессе)
+# ============================================================
+
+model_process = None
+model_req_q = None
+model_resp_q = None
+model_status = "not_started"  # not_started | loading | ready | failed
+model_lock = threading.Lock()
+
+chats_waiting_model = set()
+use_imitation = {}
+
+def start_model_worker():
+    global model_process, model_req_q, model_resp_q, model_status
+    with model_lock:
+        if model_status in ("loading", "ready"):
+            return
+        if model_status == "failed":
+            return
+        model_status = "loading"
+
+    try:
+        model_req_q = mp.Queue()
+        model_resp_q = mp.Queue()
+        model_process = mp.Process(
+            target=model_worker,
+            args=(model_req_q, model_resp_q),
+            daemon=True,
+        )
+        model_process.start()
+        print("[model] Процесс модели запущен.")
+        threading.Thread(target=_watch_model, daemon=True).start()
+    except Exception as e:
+        print(f"[model] Не удалось запустить процесс: {e}")
+        with model_lock:
+            model_status = "failed"
+
+def _watch_model():
+    global model_status
+    try:
+        status, payload = model_resp_q.get(timeout=300)
+    except Empty:
+        print("[model] Таймаут загрузки модели.")
+        _kill_model_process()
+        with model_lock:
+            model_status = "failed"
+        _notify_failed()
+        return
+    except Exception as e:
+        print(f"[model] Ошибка ожидания: {e}")
+        with model_lock:
+            model_status = "failed"
+        _notify_failed()
+        return
+
+    if status == "ready":
+        with model_lock:
+            model_status = "ready"
+        print("[model] Модель загружена.")
+        _notify_ready()
+    else:
+        print(f"[model] Ошибка инициализации: {payload}")
+        _kill_model_process()
+        with model_lock:
+            model_status = "failed"
+        _notify_failed()
+
+def _notify_ready():
+    for chat_id in list(chats_waiting_model):
         try:
-            local_model = None
+            bot.send_message(
+                chat_id,
+                "✅ Маша проснулась! Нейросеть загружена — теперь могу отвечать по-настоящему. Напиши что-нибудь."
+            )
+        except Exception as e:
+            print(f"[notify error] {e}")
+    chats_waiting_model.clear()
+
+def _notify_failed():
+    for chat_id in list(chats_waiting_model):
+        try:
+            bot.send_message(
+                chat_id,
+                "⚠️ Не удалось загрузить нейросеть. Маша будет отвечать через имитацию."
+            )
         except Exception:
             pass
+    chats_waiting_model.clear()
+
+def _kill_model_process():
+    global model_process
+    try:
+        if model_process is not None and model_process.is_alive():
+            model_process.terminate()
+            model_process.join(timeout=2)
+    except Exception:
+        pass
+
+def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):
+    global model_status, model_process
+    # Модель не готова → имитация
+    if model_status != "ready":
+        if model_status == "not_started":
+            threading.Thread(target=start_model_worker, daemon=True).start()
         return ask_imitation(user_text)
+
+    # Процесс умер? Помечаем failed и отвечаем имитацией
+    if model_process is None or not model_process.is_alive():
+        print("[model] Процесс модели умер — переключаюсь на имитацию.")
+        with model_lock:
+            model_status = "failed"
+        return ask_imitation(user_text)
+
+    try:
+        model_req_q.put((system_prompt, user_text, max_tokens))
+        status, payload = model_resp_q.get(timeout=90)
+    except Empty:
+        print("[model] Таймаут генерации.")
+        _kill_model_process()
+        with model_lock:
+            model_status = "failed"
+        return ask_imitation(user_text)
+    except Exception as e:
+        print(f"[model] Ошибка запроса: {e}")
+        return ask_imitation(user_text)
+
+    if status != "ok":
+        print(f"[model] Ошибка генерации: {payload}")
+        return ask_imitation(user_text)
+
+    answer = (payload or "").strip()
+    if not answer:
+        return ask_imitation(user_text)
+    return limit_sentences(answer, 2)
 
 def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
     def generate_reply():
@@ -299,25 +404,20 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
             pass
         try:
             answer = ask_local_model(
-                message.chat.id,
-                system_prompt,
-                user_text,
-                max_tokens=max_tokens,
+                message.chat.id, system_prompt, user_text, max_tokens=max_tokens
             )
             if not answer or not answer.strip():
                 answer = ask_imitation(user_text)
             try:
                 bot.reply_to(message, answer)
-            except Exception as send_err:
-                print(f"[send error] {send_err}")
-        except Exception as error:
-            tb = traceback.format_exc()
-            print(f"[ai error] {error}\n{tb}")
+            except Exception as e:
+                print(f"[send error] {e}")
+        except Exception as e:
+            print(f"[ai error] {e}")
             try:
                 bot.reply_to(message, ask_imitation(user_text))
-            except Exception as send_err:
-                print(f"[send error] {send_err}")
-
+            except Exception:
+                pass
     threading.Thread(target=generate_reply, daemon=True).start()
 
 muted_users = {}
@@ -343,8 +443,8 @@ def set_bot_avatar(path):
     try:
         bot.set_my_profile_photo(types.InputProfilePhotoStatic(photo=types.InputFile(path)))
         return True
-    except Exception as error:
-        print(f"[avatar error] {error}")
+    except Exception as e:
+        print(f"[avatar error] {e}")
         return False
 
 def update_lawyer_avatar():
@@ -535,14 +635,55 @@ def get_lawyer_names(message):
 def enable_prime_mode(message):
     try:
         chat_id = message.chat.id
-        chat_modes[message.chat.id] = "prime"
-        lawyer_profiles.pop(message.chat.id, None)
+        chat_modes[chat_id] = "prime"
+        lawyer_profiles.pop(chat_id, None)
         lawyer_avatar_chats.discard(chat_id)
         update_lawyer_avatar()
-        ai_histories.pop(message.chat.id, None)
-        bot.reply_to(message, "🧠 Прайм-режим включён. Теперь я отвечаю как нейросеть.")
+        ai_histories.pop(chat_id, None)
+        use_imitation[chat_id] = False
+
+        if model_status == "not_started":
+            chats_waiting_model.add(chat_id)
+            threading.Thread(target=start_model_worker, daemon=True).start()
+        elif model_status == "ready":
+            bot.reply_to(
+                message,
+                "🧠 Прайм-режим включён. Нейросеть уже загружена — можешь писать."
+            )
+            return
+
+        keyboard = types.InlineKeyboardMarkup()
+        btn = types.InlineKeyboardButton(
+            "🔄 Перейти на имитацию нейросети",
+            callback_data="use_imitation"
+        )
+        keyboard.add(btn)
+
+        bot.reply_to(
+            message,
+            "🧠 Прайм-режим включён.\n\n"
+            "⏳ Первый ответ придёт через 2–3 минуты — Маша собирается с мыслями "
+            "(загружает нейросеть). Дальше будет отвечать быстрее.\n\n"
+            "Если не хочешь ждать — нажми кнопку ниже, и Маша будет отвечать "
+            "через имитацию, пока нейросеть грузится.",
+            reply_markup=keyboard,
+        )
     except Exception as e:
         print(f"[prime error] {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == "use_imitation")
+def cb_use_imitation(call):
+    try:
+        chat_id = call.message.chat.id
+        use_imitation[chat_id] = True
+        bot.answer_callback_query(call.id, "Переключено на имитацию ✅")
+        bot.send_message(
+            chat_id,
+            "🔄 Хорошо! Пока нейросеть грузится, Маша будет отвечать из заготовок. "
+            "Когда загрузка завершится — я пришлю уведомление."
+        )
+    except Exception as e:
+        print(f"[callback error] {e}")
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/антипрайм")
 def disable_prime_mode(message):
@@ -553,6 +694,8 @@ def disable_prime_mode(message):
         lawyer_avatar_chats.discard(chat_id)
         update_lawyer_avatar()
         ai_histories.pop(chat_id, None)
+        use_imitation.pop(chat_id, None)
+        chats_waiting_model.discard(chat_id)
         bot.reply_to(message, random.choice(GAV_VARIANTS))
     except Exception as e:
         print(f"[anti-prime error] {e}")
@@ -585,6 +728,8 @@ def toggle_lawyer_mode(message):
         lawyer_avatar_chats.add(chat_id)
         update_lawyer_avatar()
         ai_histories.pop(chat_id, None)
+        if model_status == "not_started":
+            threading.Thread(target=start_model_worker, daemon=True).start()
         bot.reply_to(message, f"⚖️ Режим юриста включён.")
     except Exception as e:
         print(f"[lawyer error] {e}")
@@ -659,6 +804,15 @@ def count_messages(message):
         if mode == "prime":
             user_text = message.text or "Пользователь отправил сообщение без текста."
             identity_reply = get_bot_identity_reply(user_text)
+
+            if use_imitation.get(chat_id, False):
+                bot.reply_to(message, ask_imitation(user_text))
+                return
+
+            if model_status != "ready":
+                bot.reply_to(message, ask_imitation(user_text))
+                return
+
             if identity_reply:
                 bot.reply_to(message, identity_reply)
             else:
@@ -739,9 +893,12 @@ def run_bot():
             time.sleep(15)
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+
     health_thread = threading.Thread(target=run_health_check, daemon=True)
     health_thread.start()
     ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
     ping_thread.start()
+
     print("Бот запущен...")
     run_bot()
