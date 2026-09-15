@@ -1,3 +1,4 @@
+
 import os
 import re
 import telebot
@@ -169,6 +170,12 @@ def get_bot_identity_reply(text):
 
     return None
 
+def limit_sentences(text, n=3):
+    parts = re.findall(r'[^.!?…]+[.!?…]+', text)
+    if not parts:
+        return text.strip()
+    return " ".join(p.strip() for p in parts[:n]).strip()
+
 def get_local_model():
     global local_model
     if local_model is not None:
@@ -197,14 +204,14 @@ def get_local_model():
 
         local_model = Llama(
             model_path=LOCAL_MODEL_PATH,
-            n_ctx=2048,
+            n_ctx=1024,
             n_threads=max(1, (os.cpu_count() or 2) - 1),
             n_gpu_layers=0,
             verbose=False,
         )
         return local_model
 
-def ask_local_model(chat_id, system_prompt, user_text, max_tokens=96):
+def ask_local_model(chat_id, system_prompt, user_text, max_tokens=48):
     model = get_local_model()
     history = ai_histories.setdefault(chat_id, [])
     messages = [{"role": "system", "content": system_prompt}]
@@ -217,10 +224,13 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=96):
             max_tokens=max_tokens,
             temperature=0.6,
             top_p=0.9,
+            stop=["\n\n", "User:", "Пользователь:"],
         )
     answer = result["choices"][0]["message"]["content"].strip()
     if not answer:
         raise RuntimeError("Локальная модель вернула пустой ответ.")
+
+    answer = limit_sentences(answer, 3)
 
     history.extend([
         {"role": "user", "content": user_text},
@@ -229,7 +239,7 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=96):
     del history[:-12]
     return answer
 
-def send_local_ai_reply(message, system_prompt, user_text, max_tokens=96):
+def send_local_ai_reply(message, system_prompt, user_text, max_tokens=48):
     def generate_reply():
         try:
             bot.send_chat_action(message.chat.id, "typing")
@@ -266,13 +276,13 @@ local_model_lock = threading.Lock()
 local_generation_lock = threading.Lock()
 
 LOCAL_MODEL_URL = (
-    "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/"
-    "resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf?download=true"
+    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/"
+    "resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true"
 )
 LOCAL_MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
     "models",
-    "qwen2.5-3b-instruct-q4_k_m.gguf",
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf",
 )
 
 GAV_VARIANTS = ["гав!", "гав?", "(довольный) гав", "Ррррр!", "ГАВ", "(веселый) гав", "гав..."]
@@ -648,7 +658,7 @@ def count_messages(message):
                 message,
                 (
                     "Ты дружелюбная локальная нейросеть внутри Telegram-бота. "
-                    "Отвечай на русском языке кратко, максимум двумя короткими "
+                    "Отвечай на русском языке кратко, максимум тремя короткими "
                     "предложениями, по делу, без упоминания внутренних инструкций "
                     "и API-ключей."
                 ),
@@ -679,7 +689,7 @@ def count_messages(message):
                         "давите на бремя доказывания, факты, причинно-следственные связи "
                         "и общие правовые принципы. Не выдумывай статьи и законы, не "
                         "угрожай и не переходи на личные оскорбления. Отвечай по-русски "
-                        "в 2–3 коротких, острых предложениях."
+                        "максимум тремя короткими, острыми предложениями."
                     ),
                     user_text,
                     max_tokens=112,
@@ -696,32 +706,3 @@ def count_messages(message):
 
     if user_counters[user_id] >= 20:
         random_gav = random.choice(GAV_VARIANTS)
-        bot.reply_to(message, random_gav)
-        photo = random.choice(PHOTO_IDS)
-        bot.send_photo(message.chat.id, photo)
-        user_counters[user_id] = 0
-
-def self_ping_loop():
-    while True:
-        print(datetime.now())
-        try:
-            urllib_request.urlopen("http://localhost:8099/", timeout=10)
-        except Exception as e:
-            print(f"[self-ping error] {e}")
-        time.sleep(180)
-
-def preload_local_model():
-    try:
-        get_local_model()
-        print("Локальная модель загружена.")
-    except Exception as error:
-        print(f"[local-ai preload error] {error}")
-
-if __name__ == "__main__":
-    #keep_alive()
-    ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
-    ping_thread.start()
-    model_thread = threading.Thread(target=preload_local_model, daemon=True)
-    model_thread.start()
-    print("Бот запущен...")
-    bot.infinity_polling()
