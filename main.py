@@ -193,7 +193,7 @@ def ask_imitation(user_text):
     ])
 
 # ============================================================
-#  ВОРКЕР МОДЕЛИ (отдельный процесс — краш не убивает бота)
+#  ВОРКЕР МОДЕЛИ (отдельный процесс)
 # ============================================================
 
 LOCAL_MODEL_URL = (
@@ -207,7 +207,6 @@ LOCAL_MODEL_PATH = os.path.join(
 )
 
 def model_worker(req_q, resp_q):
-    """Работает в ОТДЕЛЬНОМ процессе. Если упадёт — убьёт только себя."""
     try:
         os.makedirs(os.path.dirname(LOCAL_MODEL_PATH), exist_ok=True)
         if not os.path.exists(LOCAL_MODEL_PATH) or os.path.getsize(LOCAL_MODEL_PATH) < 10_000_000:
@@ -261,13 +260,13 @@ def model_worker(req_q, resp_q):
             resp_q.put(("gen_error", str(e)))
 
 # ============================================================
-#  МЕНЕДЖЕР ВОРКЕРА (в главном процессе)
+#  МЕНЕДЖЕР ВОРКЕРА
 # ============================================================
 
 model_process = None
 model_req_q = None
 model_resp_q = None
-model_status = "not_started"  # not_started | loading | ready | failed
+model_status = "not_started"
 model_lock = threading.Lock()
 
 chats_waiting_model = set()
@@ -329,11 +328,19 @@ def _watch_model():
         _notify_failed()
 
 def _notify_ready():
+    # Сбрасываем флаг имитации во всех чатах с прайм-режимом,
+    # чтобы бот автоматически переключился на настоящую нейросеть
+    for chat_id in list(chat_modes.keys()):
+        if chat_modes.get(chat_id) == "prime":
+            use_imitation[chat_id] = False
+
     for chat_id in list(chats_waiting_model):
         try:
+            use_imitation[chat_id] = False
             bot.send_message(
                 chat_id,
-                "✅ Маша проснулась! Нейросеть загружена — теперь могу отвечать по-настоящему. Напиши что-нибудь."
+                "✅ Маша проснулась! Нейросеть загружена — теперь отвечаю по-настоящему. "
+                "Напиши что-нибудь."
             )
         except Exception as e:
             print(f"[notify error] {e}")
@@ -361,13 +368,11 @@ def _kill_model_process():
 
 def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):
     global model_status, model_process
-    # Модель не готова → имитация
     if model_status != "ready":
         if model_status == "not_started":
             threading.Thread(target=start_model_worker, daemon=True).start()
         return ask_imitation(user_text)
 
-    # Процесс умер? Помечаем failed и отвечаем имитацией
     if model_process is None or not model_process.is_alive():
         print("[model] Процесс модели умер — переключаюсь на имитацию.")
         with model_lock:
