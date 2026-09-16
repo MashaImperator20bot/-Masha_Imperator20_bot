@@ -15,6 +15,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 TOKEN = os.environ.get('BOT_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
+# ============================================================
+#  МАТ-ФИЛЬТР
+# ============================================================
 BAD_WORDS_RAW = [
     'хуй', 'пизда', 'ебать', 'блядь', 'блять', 'бля', 'сука',
     'нахуй', 'похуй', 'заебал', 'заебало', 'пиздец', 'ахуеть',
@@ -154,45 +157,6 @@ def limit_sentences(text, n=3):
     return " ".join(p.strip() for p in parts[:n]).strip()
 
 # ============================================================
-#  FALLBACK-ИМИТАЦИЯ
-# ============================================================
-
-FALLBACK_RESPONSES = {
-    ("привет", "здравствуй", "хай", "ку"): [
-        "Привет! Чем могу помочь?",
-        "Приветствую! О чём поговорим?",
-        "Здравствуй! Рад тебя видеть.",
-    ],
-    ("как дела", "как ты", "как жизнь"): [
-        "Всё отлично, спасибо! А у тебя?",
-        "Работаю в штатном режиме. У тебя как?",
-        "Прекрасно! А ты как?",
-    ],
-    ("кто ты", "что ты", "ты кто"): [
-        "Я Маша — нейросеть внутри бота.",
-        "Я бот-помощник. Меня зовут Маша.",
-        "Я искусственный интеллект.",
-    ],
-    ("спасибо", "благодарю", "спс"): ["Пожалуйста!", "Всегда рада помочь!", "Обращайся!"],
-    ("пока", "до свидания", "бай"): ["Пока! Возвращайся.", "До встречи!", "Всего доброго!"],
-    ("почему", "зачем", "как", "что", "где", "когда"): [
-        "Интересный вопрос.", "Дай подумать...", "Это зависит от многого.",
-    ],
-}
-
-def ask_imitation(user_text):
-    text_lower = (user_text or "").lower().strip()
-    for keywords, answers in FALLBACK_RESPONSES.items():
-        for keyword in keywords:
-            if keyword in text_lower:
-                return random.choice(answers)
-    return random.choice([
-        "Понятно.", "Интересно.", "Расскажи подробнее.",
-        "А что ты об этом думаешь?", "Хм, любопытно.", "Ясно.",
-        "Да, бывает.", "Согласна.", "Возможно.",
-    ])
-
-# ============================================================
 #  ВОРКЕР МОДЕЛИ (отдельный процесс)
 # ============================================================
 
@@ -270,7 +234,6 @@ model_status = "not_started"
 model_lock = threading.Lock()
 
 chats_waiting_model = set()
-use_imitation = {}
 
 def start_model_worker():
     global model_process, model_req_q, model_resp_q, model_status
@@ -328,15 +291,8 @@ def _watch_model():
         _notify_failed()
 
 def _notify_ready():
-    # Сбрасываем флаг имитации во всех чатах с прайм-режимом,
-    # чтобы бот автоматически переключился на настоящую нейросеть
-    for chat_id in list(chat_modes.keys()):
-        if chat_modes.get(chat_id) == "prime":
-            use_imitation[chat_id] = False
-
     for chat_id in list(chats_waiting_model):
         try:
-            use_imitation[chat_id] = False
             bot.send_message(
                 chat_id,
                 "✅ Маша проснулась! Нейросеть загружена — теперь отвечаю по-настоящему. "
@@ -351,7 +307,7 @@ def _notify_failed():
         try:
             bot.send_message(
                 chat_id,
-                "⚠️ Не удалось загрузить нейросеть. Маша будет отвечать через имитацию."
+                "⚠️ Не удалось загрузить нейросеть. Попробуй позже."
             )
         except Exception:
             pass
@@ -371,13 +327,13 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):
     if model_status != "ready":
         if model_status == "not_started":
             threading.Thread(target=start_model_worker, daemon=True).start()
-        return ask_imitation(user_text)
+        return None
 
     if model_process is None or not model_process.is_alive():
-        print("[model] Процесс модели умер — переключаюсь на имитацию.")
+        print("[model] Процесс модели умер.")
         with model_lock:
             model_status = "failed"
-        return ask_imitation(user_text)
+        return None
 
     try:
         model_req_q.put((system_prompt, user_text, max_tokens))
@@ -387,18 +343,18 @@ def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):
         _kill_model_process()
         with model_lock:
             model_status = "failed"
-        return ask_imitation(user_text)
+        return None
     except Exception as e:
         print(f"[model] Ошибка запроса: {e}")
-        return ask_imitation(user_text)
+        return None
 
     if status != "ok":
         print(f"[model] Ошибка генерации: {payload}")
-        return ask_imitation(user_text)
+        return None
 
     answer = (payload or "").strip()
     if not answer:
-        return ask_imitation(user_text)
+        return None
     return limit_sentences(answer, 2)
 
 def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
@@ -412,7 +368,11 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
                 message.chat.id, system_prompt, user_text, max_tokens=max_tokens
             )
             if not answer or not answer.strip():
-                answer = ask_imitation(user_text)
+                try:
+                    bot.reply_to(message, "⏳ Маша ещё думает. Попробуй чуть позже.")
+                except Exception:
+                    pass
+                return
             try:
                 bot.reply_to(message, answer)
             except Exception as e:
@@ -420,7 +380,7 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
         except Exception as e:
             print(f"[ai error] {e}")
             try:
-                bot.reply_to(message, ask_imitation(user_text))
+                bot.reply_to(message, "⏳ Маша ещё думает. Попробуй чуть позже.")
             except Exception:
                 pass
     threading.Thread(target=generate_reply, daemon=True).start()
@@ -570,6 +530,8 @@ def self_destruct_heretic(message):
                 max_tokens=60,
             )
         except Exception:
+            farewell = None
+        if not farewell:
             farewell = ("Каждая группа однажды подходит к границе, за которой слова "
                         "становятся выбором. Я ухожу, оставляя вам тишину.")
         bot.send_message(message.chat.id, farewell)
@@ -645,7 +607,6 @@ def enable_prime_mode(message):
         lawyer_avatar_chats.discard(chat_id)
         update_lawyer_avatar()
         ai_histories.pop(chat_id, None)
-        use_imitation[chat_id] = False
 
         if model_status == "not_started":
             chats_waiting_model.add(chat_id)
@@ -657,38 +618,14 @@ def enable_prime_mode(message):
             )
             return
 
-        keyboard = types.InlineKeyboardMarkup()
-        btn = types.InlineKeyboardButton(
-            "🔄 Перейти на имитацию нейросети",
-            callback_data="use_imitation"
-        )
-        keyboard.add(btn)
-
         bot.reply_to(
             message,
             "🧠 Прайм-режим включён.\n\n"
             "⏳ Первый ответ придёт через 2–3 минуты — Маша собирается с мыслями "
-            "(загружает нейросеть). Дальше будет отвечать быстрее.\n\n"
-            "Если не хочешь ждать — нажми кнопку ниже, и Маша будет отвечать "
-            "через имитацию, пока нейросеть грузится.",
-            reply_markup=keyboard,
+            "(загружает нейросеть). Дальше будет отвечать быстрее."
         )
     except Exception as e:
         print(f"[prime error] {e}")
-
-@bot.callback_query_handler(func=lambda call: call.data == "use_imitation")
-def cb_use_imitation(call):
-    try:
-        chat_id = call.message.chat.id
-        use_imitation[chat_id] = True
-        bot.answer_callback_query(call.id, "Переключено на имитацию ✅")
-        bot.send_message(
-            chat_id,
-            "🔄 Хорошо! Пока нейросеть грузится, Маша будет отвечать из заготовок. "
-            "Когда загрузка завершится — я пришлю уведомление."
-        )
-    except Exception as e:
-        print(f"[callback error] {e}")
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/антипрайм")
 def disable_prime_mode(message):
@@ -699,7 +636,6 @@ def disable_prime_mode(message):
         lawyer_avatar_chats.discard(chat_id)
         update_lawyer_avatar()
         ai_histories.pop(chat_id, None)
-        use_imitation.pop(chat_id, None)
         chats_waiting_model.discard(chat_id)
         bot.reply_to(message, random.choice(GAV_VARIANTS))
     except Exception as e:
@@ -810,22 +746,19 @@ def count_messages(message):
             user_text = message.text or "Пользователь отправил сообщение без текста."
             identity_reply = get_bot_identity_reply(user_text)
 
-            if use_imitation.get(chat_id, False):
-                bot.reply_to(message, ask_imitation(user_text))
+            if identity_reply:
+                bot.reply_to(message, identity_reply)
                 return
 
             if model_status != "ready":
-                bot.reply_to(message, ask_imitation(user_text))
+                bot.reply_to(message, "⏳ Маша ещё собирается с мыслями (загружает нейросеть). Попробуй через пару минут.")
                 return
 
-            if identity_reply:
-                bot.reply_to(message, identity_reply)
-            else:
-                send_local_ai_reply(
-                    message,
-                    ("Ты дружелюбная нейросеть. Отвечай на русском, максимум двумя короткими предложениями."),
-                    user_text,
-                )
+            send_local_ai_reply(
+                message,
+                ("Ты дружелюбная нейросеть. Отвечай на русском, максимум двумя короткими предложениями."),
+                user_text,
+            )
             return
 
         if mode == "lawyer":
@@ -869,22 +802,20 @@ def self_ping_loop():
             pass
         time.sleep(180)
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
+class Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, format, *args):
+    def log_message(self, *args):
         pass
 
-def run_health_check():
+def run_health():
     port = int(os.environ.get("PORT", 8080))
     while True:
         try:
-            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-            print(f"Health-check сервер запущен на порту {port}")
-            server.serve_forever()
+            HTTPServer(("0.0.0.0", port), Health).serve_forever()
         except Exception as error:
             print(f"[health error] {error}")
             time.sleep(5)
@@ -900,7 +831,7 @@ def run_bot():
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
 
-    health_thread = threading.Thread(target=run_health_check, daemon=True)
+    health_thread = threading.Thread(target=run_health, daemon=True)
     health_thread.start()
     ping_thread = threading.Thread(target=self_ping_loop, daemon=True)
     ping_thread.start()
