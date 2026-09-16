@@ -157,17 +157,17 @@ def limit_sentences(text, n=3):
     return " ".join(p.strip() for p in parts[:n]).strip()
 
 # ============================================================
-#  ВОРКЕР МОДЕЛИ (отдельный процесс)
+#  ВОРКЕР МОДЕЛИ (Qwen2.5-0.5B — проверенная)
 # ============================================================
 
 LOCAL_MODEL_URL = (
-    "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct-GGUF/"
-    "resolve/main/smollm2-135m-instruct-q4_k_m.gguf?download=true"
+    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/"
+    "resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true"
 )
 LOCAL_MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
     "models",
-    "smollm2-135m-instruct-q4_k_m.gguf",
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf",
 )
 
 def model_worker(req_q, resp_q):
@@ -187,7 +187,7 @@ def model_worker(req_q, resp_q):
         from llama_cpp import Llama
         llm = Llama(
             model_path=LOCAL_MODEL_PATH,
-            n_ctx=128,
+            n_ctx=256,
             n_threads=2,
             n_gpu_layers=0,
             chat_format="chatml",
@@ -368,10 +368,6 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
                 message.chat.id, system_prompt, user_text, max_tokens=max_tokens
             )
             if not answer or not answer.strip():
-                try:
-                    bot.reply_to(message, "⏳ Маша ещё думает. Попробуй чуть позже.")
-                except Exception:
-                    pass
                 return
             try:
                 bot.reply_to(message, answer)
@@ -379,10 +375,6 @@ def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
                 print(f"[send error] {e}")
         except Exception as e:
             print(f"[ai error] {e}")
-            try:
-                bot.reply_to(message, "⏳ Маша ещё думает. Попробуй чуть позже.")
-            except Exception:
-                pass
     threading.Thread(target=generate_reply, daemon=True).start()
 
 muted_users = {}
@@ -608,15 +600,13 @@ def enable_prime_mode(message):
         update_lawyer_avatar()
         ai_histories.pop(chat_id, None)
 
+        if model_status == "ready":
+            bot.reply_to(message, "🧠 Прайм-режим включён. Нейросеть уже загружена — можешь писать.")
+            return
+
         if model_status == "not_started":
             chats_waiting_model.add(chat_id)
             threading.Thread(target=start_model_worker, daemon=True).start()
-        elif model_status == "ready":
-            bot.reply_to(
-                message,
-                "🧠 Прайм-режим включён. Нейросеть уже загружена — можешь писать."
-            )
-            return
 
         bot.reply_to(
             message,
@@ -751,7 +741,6 @@ def count_messages(message):
                 return
 
             if model_status != "ready":
-                bot.reply_to(message, "⏳ Маша ещё собирается с мыслями (загружает нейросеть). Попробуй через пару минут.")
                 return
 
             send_local_ai_reply(
@@ -772,6 +761,8 @@ def count_messages(message):
                 if identity_reply:
                     bot.reply_to(message, identity_reply)
                 else:
+                    if model_status != "ready":
+                        return
                     send_local_ai_reply(
                         message,
                         (f"Ты жёсткий юридический защитник. Отвечай по-русски максимум двумя предложениями."),
