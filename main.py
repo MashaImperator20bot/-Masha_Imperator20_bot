@@ -1,18 +1,27 @@
 import os
 import re
+import json
 import telebot
 import random
 import threading
 import time
 import traceback
-import multiprocessing as mp
-from queue import Empty
+import requests
 from telebot import types
 from datetime import datetime, timedelta
 from urllib import request as urllib_request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = os.environ.get('BOT_TOKEN')
+
+# ============================================================
+#  GROQ КЛЮЧ (репозиторий приватный, поэтому можно в коде)
+# ============================================================
+GROQ_API_KEY = "gsk_вставь_свой_ключ_сюда"
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
 bot = telebot.TeleBot(TOKEN)
 
 # ============================================================
@@ -157,226 +166,65 @@ def limit_sentences(text, n=3):
     return " ".join(p.strip() for p in parts[:n]).strip()
 
 # ============================================================
-#  ВОРКЕР МОДЕЛИ (Qwen2.5-0.5B — проверенная)
+#  GROQ — быстрые ответы (работает на серверах Groq)
 # ============================================================
 
-LOCAL_MODEL_URL = (
-    "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/"
-    "resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf?download=true"
-)
-LOCAL_MODEL_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "models",
-    "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-)
+def ask_groq(system_prompt, user_text, max_tokens=120):
+    if not GROQ_API_KEY or "вставь_свой_ключ" in GROQ_API_KEY:
+        print("[groq] Ключ не задан.")
+        return None
 
-def model_worker(req_q, resp_q):
-    try:
-        os.makedirs(os.path.dirname(LOCAL_MODEL_PATH), exist_ok=True)
-        if not os.path.exists(LOCAL_MODEL_PATH) or os.path.getsize(LOCAL_MODEL_PATH) < 10_000_000:
-            temp_path = f"{LOCAL_MODEL_PATH}.part"
-            with urllib_request.urlopen(LOCAL_MODEL_URL, timeout=60) as response:
-                with open(temp_path, "wb") as f:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-            os.replace(temp_path, LOCAL_MODEL_PATH)
-
-        from llama_cpp import Llama
-        llm = Llama(
-            model_path=LOCAL_MODEL_PATH,
-            n_ctx=256,
-            n_threads=2,
-            n_gpu_layers=0,
-            chat_format="chatml",
-            verbose=False,
-        )
-    except Exception as e:
-        resp_q.put(("init_error", str(e)))
-        return
-
-    resp_q.put(("ready", None))
-
-    while True:
-        try:
-            req = req_q.get()
-        except (EOFError, OSError):
-            break
-        if req is None:
-            break
-        try:
-            system_prompt, user_text, max_tokens = req
-            messages = [
-                {"role": "system", "content": (system_prompt or "")[:120]},
-                {"role": "user", "content": (user_text or "")[:120]},
-            ]
-            result = llm.create_chat_completion(
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.6,
-                top_p=0.9,
-            )
-            answer = result["choices"][0]["message"]["content"].strip()
-            resp_q.put(("ok", answer))
-        except Exception as e:
-            resp_q.put(("gen_error", str(e)))
-
-# ============================================================
-#  МЕНЕДЖЕР ВОРКЕРА
-# ============================================================
-
-model_process = None
-model_req_q = None
-model_resp_q = None
-model_status = "not_started"
-model_lock = threading.Lock()
-
-chats_waiting_model = set()
-
-def start_model_worker():
-    global model_process, model_req_q, model_resp_q, model_status
-    with model_lock:
-        if model_status in ("loading", "ready"):
-            return
-        if model_status == "failed":
-            return
-        model_status = "loading"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.7,
+    }
 
     try:
-        model_req_q = mp.Queue()
-        model_resp_q = mp.Queue()
-        model_process = mp.Process(
-            target=model_worker,
-            args=(model_req_q, model_resp_q),
-            daemon=True,
-        )
-        model_process.start()
-        print("[model] Процесс модели запущен.")
-        threading.Thread(target=_watch_model, daemon=True).start()
-    except Exception as e:
-        print(f"[model] Не удалось запустить процесс: {e}")
-        with model_lock:
-            model_status = "failed"
-
-def _watch_model():
-    global model_status
-    try:
-        status, payload = model_resp_q.get(timeout=300)
-    except Empty:
-        print("[model] Таймаут загрузки модели.")
-        _kill_model_process()
-        with model_lock:
-            model_status = "failed"
-        _notify_failed()
-        return
-    except Exception as e:
-        print(f"[model] Ошибка ожидания: {e}")
-        with model_lock:
-            model_status = "failed"
-        _notify_failed()
-        return
-
-    if status == "ready":
-        with model_lock:
-            model_status = "ready"
-        print("[model] Модель загружена.")
-        _notify_ready()
-    else:
-        print(f"[model] Ошибка инициализации: {payload}")
-        _kill_model_process()
-        with model_lock:
-            model_status = "failed"
-        _notify_failed()
-
-def _notify_ready():
-    for chat_id in list(chats_waiting_model):
-        try:
-            bot.send_message(
-                chat_id,
-                "✅ Маша проснулась! Нейросеть загружена — теперь отвечаю по-настоящему. "
-                "Напиши что-нибудь."
-            )
-        except Exception as e:
-            print(f"[notify error] {e}")
-    chats_waiting_model.clear()
-
-def _notify_failed():
-    for chat_id in list(chats_waiting_model):
-        try:
-            bot.send_message(
-                chat_id,
-                "⚠️ Не удалось загрузить нейросеть. Попробуй позже."
-            )
-        except Exception:
-            pass
-    chats_waiting_model.clear()
-
-def _kill_model_process():
-    global model_process
-    try:
-        if model_process is not None and model_process.is_alive():
-            model_process.terminate()
-            model_process.join(timeout=2)
-    except Exception:
-        pass
-
-def ask_local_model(chat_id, system_prompt, user_text, max_tokens=20):
-    global model_status, model_process
-    if model_status != "ready":
-        if model_status == "not_started":
-            threading.Thread(target=start_model_worker, daemon=True).start()
+        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        answer = data["choices"][0]["message"]["content"].strip()
+        return answer if answer else None
+    except requests.exceptions.RequestException as e:
+        print(f"[groq error] {e}")
         return None
 
-    if model_process is None or not model_process.is_alive():
-        print("[model] Процесс модели умер.")
-        with model_lock:
-            model_status = "failed"
-        return None
-
-    try:
-        model_req_q.put((system_prompt, user_text, max_tokens))
-        status, payload = model_resp_q.get(timeout=90)
-    except Empty:
-        print("[model] Таймаут генерации.")
-        _kill_model_process()
-        with model_lock:
-            model_status = "failed"
-        return None
-    except Exception as e:
-        print(f"[model] Ошибка запроса: {e}")
-        return None
-
-    if status != "ok":
-        print(f"[model] Ошибка генерации: {payload}")
-        return None
-
-    answer = (payload or "").strip()
-    if not answer:
-        return None
-    return limit_sentences(answer, 2)
-
-def send_local_ai_reply(message, system_prompt, user_text, max_tokens=20):
-    def generate_reply():
+def send_ai_reply(message, system_prompt, user_text, max_tokens=120):
+    def worker():
         try:
             bot.send_chat_action(message.chat.id, "typing")
         except Exception:
             pass
-        try:
-            answer = ask_local_model(
-                message.chat.id, system_prompt, user_text, max_tokens=max_tokens
-            )
-            if not answer or not answer.strip():
-                return
-            try:
-                bot.reply_to(message, answer)
-            except Exception as e:
-                print(f"[send error] {e}")
-        except Exception as e:
-            print(f"[ai error] {e}")
-    threading.Thread(target=generate_reply, daemon=True).start()
 
+        answer = ask_groq(system_prompt, user_text, max_tokens=max_tokens)
+        if not answer:
+            try:
+                bot.reply_to(message, "⚠️ Маша не смогла ответить. Попробуй ещё раз.")
+            except Exception:
+                pass
+            return
+
+        answer = limit_sentences(answer, 3)
+
+        try:
+            bot.reply_to(message, answer)
+        except Exception as e:
+            print(f"[send error] {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+# ============================================================
+#  СОСТОЯНИЕ
+# ============================================================
 muted_users = {}
 mat_filter_enabled = {}
 last_messages = {}
@@ -387,7 +235,6 @@ used_unban_words = {}
 chat_modes = {}
 lawyer_profiles = {}
 lawyer_avatar_chats = set()
-ai_histories = {}
 self_destruct_enabled = {}
 
 GAV_VARIANTS = ["гав!", "гав?", "(довольный) гав", "Ррррр!", "ГАВ", "(веселый) гав", "гав..."]
@@ -462,6 +309,10 @@ def set_manual_ban(message, duration_minutes):
     period = "навсегда" if duration_minutes is None else f"на {duration_minutes} мин."
     bot.reply_to(message, f"✅ Сообщения пользователя будут удаляться {period}.")
 
+# ============================================================
+#  ОБРАБОТЧИКИ КОМАНД
+# ============================================================
+
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/экстерминатус")
 def exterminate_last_user(message):
     try:
@@ -514,15 +365,11 @@ def self_destruct_heretic(message):
             "Напиши короткую философскую речь-прощание от Маши. 3–4 предложения.\n\n"
             f"Контекст:\n{context_text[:1800]}"
         )
-        try:
-            farewell = ask_local_model(
-                message.chat.id,
-                "Ты Маша — философский голос бота.",
-                farewell_prompt,
-                max_tokens=60,
-            )
-        except Exception:
-            farewell = None
+        farewell = ask_groq(
+            "Ты Маша — философский голос бота.",
+            farewell_prompt,
+            max_tokens=200,
+        )
         if not farewell:
             farewell = ("Каждая группа однажды подходит к границе, за которой слова "
                         "становятся выбором. Я ухожу, оставляя вам тишину.")
@@ -598,22 +445,7 @@ def enable_prime_mode(message):
         lawyer_profiles.pop(chat_id, None)
         lawyer_avatar_chats.discard(chat_id)
         update_lawyer_avatar()
-        ai_histories.pop(chat_id, None)
-
-        if model_status == "ready":
-            bot.reply_to(message, "🧠 Прайм-режим включён. Нейросеть уже загружена — можешь писать.")
-            return
-
-        if model_status == "not_started":
-            chats_waiting_model.add(chat_id)
-            threading.Thread(target=start_model_worker, daemon=True).start()
-
-        bot.reply_to(
-            message,
-            "🧠 Прайм-режим включён.\n\n"
-            "⏳ Первый ответ придёт через 2–3 минуты — Маша собирается с мыслями "
-            "(загружает нейросеть). Дальше будет отвечать быстрее."
-        )
+        bot.reply_to(message, "🧠 Прайм-режим включён. Теперь я отвечаю как нейросеть.")
     except Exception as e:
         print(f"[prime error] {e}")
 
@@ -625,8 +457,6 @@ def disable_prime_mode(message):
         lawyer_profiles.pop(chat_id, None)
         lawyer_avatar_chats.discard(chat_id)
         update_lawyer_avatar()
-        ai_histories.pop(chat_id, None)
-        chats_waiting_model.discard(chat_id)
         bot.reply_to(message, random.choice(GAV_VARIANTS))
     except Exception as e:
         print(f"[anti-prime error] {e}")
@@ -640,7 +470,6 @@ def toggle_lawyer_mode(message):
             lawyer_profiles.pop(chat_id, None)
             lawyer_avatar_chats.discard(chat_id)
             update_lawyer_avatar()
-            ai_histories.pop(chat_id, None)
             bot.reply_to(message, random.choice(GAV_VARIANTS))
             return
         last_message = last_messages.get(chat_id)
@@ -658,9 +487,6 @@ def toggle_lawyer_mode(message):
         chat_modes[chat_id] = "lawyer"
         lawyer_avatar_chats.add(chat_id)
         update_lawyer_avatar()
-        ai_histories.pop(chat_id, None)
-        if model_status == "not_started":
-            threading.Thread(target=start_model_worker, daemon=True).start()
         bot.reply_to(message, f"⚖️ Режим юриста включён.")
     except Exception as e:
         print(f"[lawyer error] {e}")
@@ -740,13 +566,12 @@ def count_messages(message):
                 bot.reply_to(message, identity_reply)
                 return
 
-            if model_status != "ready":
-                return
-
-            send_local_ai_reply(
+            send_ai_reply(
                 message,
-                ("Ты дружелюбная нейросеть. Отвечай на русском, максимум двумя короткими предложениями."),
+                ("Ты дружелюбная нейросеть внутри Telegram-бота. "
+                 "Отвечай на русском языке кратко, максимум тремя короткими предложениями, по делу."),
                 user_text,
+                max_tokens=150,
             )
             return
 
@@ -761,13 +586,15 @@ def count_messages(message):
                 if identity_reply:
                     bot.reply_to(message, identity_reply)
                 else:
-                    if model_status != "ready":
-                        return
-                    send_local_ai_reply(
+                    send_ai_reply(
                         message,
-                        (f"Ты жёсткий юридический защитник. Отвечай по-русски максимум двумя предложениями."),
+                        (f"Ты жёсткий юридический защитник пользователя "
+                         f"{profile['protected_name']} в споре с {profile['defender_name']}. "
+                         "Найди логические ошибки, манипуляции и отсутствие доказательств, "
+                         "затем дай уверенное юридическое возражение. Не выдумывай статьи и законы. "
+                         "Отвечай по-русски максимум тремя короткими предложениями."),
                         user_text,
-                        max_tokens=30,
+                        max_tokens=150,
                     )
             return
 
@@ -784,6 +611,10 @@ def count_messages(message):
             user_counters[user_id] = 0
     except Exception as e:
         print(f"[count_messages error] {e}\n{traceback.format_exc()}")
+
+# ============================================================
+#  HEALTH-CHECK ДЛЯ RELAXDEV
+# ============================================================
 
 def self_ping_loop():
     while True:
@@ -820,7 +651,8 @@ def run_bot():
             time.sleep(15)
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
+    if not GROQ_API_KEY or "вставь_свой_ключ" in GROQ_API_KEY:
+        print("⚠️ GROQ_API_KEY не задан в коде! Вставь ключ в переменную GROQ_API_KEY.")
 
     health_thread = threading.Thread(target=run_health, daemon=True)
     health_thread.start()
