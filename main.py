@@ -15,12 +15,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 TOKEN = os.environ.get('BOT_TOKEN')
 
 # ============================================================
-#  GROQ КЛЮЧ (репозиторий приватный, поэтому можно в коде)
+#  OPENROUTER — вставь свой ключ
 # ============================================================
-GROQ_API_KEY = "gsk_вставь_свой_ключ_сюда"
+OPENROUTER_API_KEY = "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"
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -166,20 +166,22 @@ def limit_sentences(text, n=3):
     return " ".join(p.strip() for p in parts[:n]).strip()
 
 # ============================================================
-#  GROQ — быстрые ответы (работает на серверах Groq)
+#  OPENROUTER
 # ============================================================
 
-def ask_groq(system_prompt, user_text, max_tokens=120):
-    if not GROQ_API_KEY or "вставь_свой_ключ" in GROQ_API_KEY:
-        print("[groq] Ключ не задан.")
+def ask_openrouter(system_prompt, user_text, max_tokens=120):
+    if not OPENROUTER_API_KEY or "вставь_свой_ключ" in OPENROUTER_API_KEY:
+        print("[openrouter] Ключ не задан.")
         return None
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
+        "HTTP-Referer": "https://t.me/",
+        "X-Title": "Masha Bot",
     }
     payload = {
-        "model": GROQ_MODEL,
+        "model": OPENROUTER_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
@@ -189,13 +191,16 @@ def ask_groq(system_prompt, user_text, max_tokens=120):
     }
 
     try:
-        r = requests.post(GROQ_URL, headers=headers, json=payload, timeout=30)
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
         data = r.json()
+        if "error" in data:
+            print(f"[openrouter error] {data['error']}")
+            return None
         answer = data["choices"][0]["message"]["content"].strip()
         return answer if answer else None
     except requests.exceptions.RequestException as e:
-        print(f"[groq error] {e}")
+        print(f"[openrouter error] {e}")
         return None
 
 def send_ai_reply(message, system_prompt, user_text, max_tokens=120):
@@ -205,7 +210,7 @@ def send_ai_reply(message, system_prompt, user_text, max_tokens=120):
         except Exception:
             pass
 
-        answer = ask_groq(system_prompt, user_text, max_tokens=max_tokens)
+        answer = ask_openrouter(system_prompt, user_text, max_tokens=max_tokens)
         if not answer:
             try:
                 bot.reply_to(message, "⚠️ Маша не смогла ответить. Попробуй ещё раз.")
@@ -365,7 +370,7 @@ def self_destruct_heretic(message):
             "Напиши короткую философскую речь-прощание от Маши. 3–4 предложения.\n\n"
             f"Контекст:\n{context_text[:1800]}"
         )
-        farewell = ask_groq(
+        farewell = ask_openrouter(
             "Ты Маша — философский голос бота.",
             farewell_prompt,
             max_tokens=200,
@@ -651,8 +656,8 @@ def run_bot():
             time.sleep(15)
 
 if __name__ == "__main__":
-    if not GROQ_API_KEY or "вставь_свой_ключ" in GROQ_API_KEY:
-        print("⚠️ GROQ_API_KEY не задан в коде! Вставь ключ в переменную GROQ_API_KEY.")
+    if not OPENROUTER_API_KEY or "вставь_свой_ключ" in OPENROUTER_API_KEY:
+        print("⚠️ OPENROUTER_API_KEY не задан в коде! Вставь ключ в переменную OPENROUTER_API_KEY.")
 
     health_thread = threading.Thread(target=run_health, daemon=True)
     health_thread.start()
