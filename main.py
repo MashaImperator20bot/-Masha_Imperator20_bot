@@ -7,6 +7,11 @@ import threading
 import time
 import traceback
 import requests
+import subprocess
+import asyncio
+import librosa
+import soundfile as sf
+import edge_tts
 from telebot import types
 from datetime import datetime, timedelta
 from urllib import request as urllib_request
@@ -15,14 +20,43 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 TOKEN = os.environ.get('BOT_TOKEN')
 
 # ============================================================
-#  OPENROUTER — вставь свой ключ
+#  OPENROUTER
 # ============================================================
-OPENROUTER_API_KEY = "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"
-
+OPENROUTER_API_KEY = "sk-or-v1-вставь_свой_ключ_сюда"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 bot = telebot.TeleBot(TOKEN)
+
+_original_reply_to = bot.reply_to
+
+def _safe_reply_to(message, text, **kwargs):
+    try:
+        return _original_reply_to(message, text, **kwargs)
+    except Exception:
+        try:
+            return bot.send_message(message.chat.id, text, **kwargs)
+        except Exception:
+            return None
+
+bot.reply_to = _safe_reply_to
+
+FFMPEG_PATH = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True).stdout.strip() or "ffmpeg"
+
+# ============================================================
+#  СОСТОЯНИЕ
+# ============================================================
+voice_mode_enabled = {}
+voice_pitch = {}
+invis_users = {}
+speak_users = {}
+speak_voice = {}
+
+EDGE_VOICES = {
+    "1": ("ru-RU-SvetlanaNeural", "Светлана (женский)"),
+    "2": ("ru-RU-DmitryNeural", "Дмитрий (мужской)"),
+    "3": ("ru-RU-DmitryNeural", "💀 Демон (страшный, с эхом)"),
+}
 
 # ============================================================
 #  МАТ-ФИЛЬТР
@@ -173,7 +207,6 @@ def ask_openrouter(system_prompt, user_text, max_tokens=120):
     if not OPENROUTER_API_KEY or "вставь_свой_ключ" in OPENROUTER_API_KEY:
         print("[openrouter] Ключ не задан.")
         return None
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -189,7 +222,6 @@ def ask_openrouter(system_prompt, user_text, max_tokens=120):
         "max_tokens": max_tokens,
         "temperature": 0.7,
     }
-
     try:
         r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
@@ -209,27 +241,247 @@ def send_ai_reply(message, system_prompt, user_text, max_tokens=120):
             bot.send_chat_action(message.chat.id, "typing")
         except Exception:
             pass
-
         answer = ask_openrouter(system_prompt, user_text, max_tokens=max_tokens)
         if not answer:
-            try:
-                bot.reply_to(message, "⚠️ Маша не смогла ответить. Попробуй ещё раз.")
-            except Exception:
-                pass
             return
-
         answer = limit_sentences(answer, 3)
-
         try:
             bot.reply_to(message, answer)
         except Exception as e:
             print(f"[send error] {e}")
-
     threading.Thread(target=worker, daemon=True).start()
 
 # ============================================================
-#  СОСТОЯНИЕ
+#  TTS (EDGE-TTS)
 # ============================================================
+
+def tts_generate(text, output_mp3, voice="ru-RU-SvetlanaNeural"):
+    async def _run():
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(output_mp3)
+    asyncio.run(_run())
+
+def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-SvetlanaNeural", voice_key="1"):
+    """Озвучивает текст. Если voice_key == '3' — добавляет страшные эффекты."""
+    try:
+        ts = int(time.time() * 1000)
+        mp3_path = f"/tmp/tts_{chat_id}_{ts}.mp3"
+        ogg_path = f"/tmp/tts_{chat_id}_{ts}.ogg"
+
+        # 1. Генерируем базовый голос
+        tts_generate(text[:500], mp3_path, voice)
+
+        # 2. Конвертация в OGG/Opus. Для голоса 3 — страшные фильтры
+        if voice_key == "3":
+            # Понижаем тон (asetrate) + двойное эхо (aecho)
+            filter_chain = (
+                "asetrate=44100*0.75,atempo=1.333,"
+                "aecho=0.8:0.9:60|180:0.4|0.25,"
+                "aecho=0.6:0.7:400:0.3"
+            )
+            subprocess.run([
+                FFMPEG_PATH, '-i', mp3_path,
+                '-filter:a', filter_chain,
+                '-c:a', 'libopus', '-b:a', '64k',
+                ogg_path, '-y'
+            ], capture_output=True)
+        else:
+            subprocess.run([
+                FFMPEG_PATH, '-i', mp3_path,
+                '-c:a', 'libopus', '-b:a', '64k',
+                ogg_path, '-y'
+            ], capture_output=True)
+
+        # 3. Отправляем
+        with open(ogg_path, 'rb') as f:
+            try:
+                bot.send_voice(chat_id, f, reply_to_message_id=reply_to_id)
+            except Exception:
+                f.seek(0)
+                bot.send_voice(chat_id, f)
+
+        for p in [mp3_path, ogg_path]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[tts error] {e}")
+        try:
+            bot.send_message(chat_id, f"⚠️ Не удалось озвучить: {str(e)[:150]}")
+        except Exception:
+            pass
+
+# ============================================================
+#  ИЗМЕНЕНИЕ ТОНА ГОЛОСОВОГО
+# ============================================================
+
+def change_voice_pitch(message, semitones=4):
+    try:
+        file_info = bot.get_file(message.voice.file_id)
+        downloaded = requests.get(
+            f'https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}'
+        )
+
+        ts = int(time.time() * 1000)
+        input_path = f"/tmp/in_{ts}.ogg"
+        wav_path = f"/tmp/in_{ts}.wav"
+        out_wav = f"/tmp/out_{ts}.wav"
+        out_ogg = f"/tmp/out_{ts}.ogg"
+
+        with open(input_path, 'wb') as f:
+            f.write(downloaded.content)
+
+        subprocess.run([
+            FFMPEG_PATH, '-i', input_path,
+            '-ar', '22050', '-ac', '1', wav_path, '-y'
+        ], capture_output=True)
+
+        y, sr = librosa.load(wav_path, sr=22050)
+        y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
+        sf.write(out_wav, y_shifted, sr)
+
+        subprocess.run([
+            FFMPEG_PATH, '-i', out_wav,
+            '-c:a', 'libopus', '-b:a', '64k', out_ogg, '-y'
+        ], capture_output=True)
+
+        with open(out_ogg, 'rb') as f:
+            try:
+                bot.send_voice(message.chat.id, f, reply_to_message_id=message.message_id)
+            except Exception:
+                f.seek(0)
+                bot.send_voice(message.chat.id, f)
+
+        for p in [input_path, wav_path, out_wav, out_ogg]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[pitch error] {e}")
+        bot.reply_to(message, f"❌ Ошибка: {str(e)[:200]}")
+
+# ============================================================
+#  КОМАНДЫ ГОЛОСА
+# ============================================================
+
+@bot.message_handler(commands=['voice'])
+def enable_voice_mode(message):
+    chat_id = message.chat.id
+    voice_mode_enabled[chat_id] = True
+    voice_pitch.setdefault(chat_id, 4)
+    bot.reply_to(
+        message,
+        f"🎤 Режим изменения голоса *включён*.\n"
+        f"Тон: *{voice_pitch[chat_id]:+d}* полутонов.\n\n"
+        f"`/pitch N` — изменить тон (от -12 до +12)\n"
+        f"`/voice_off` — выключить",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['voice_off'])
+def disable_voice_mode(message):
+    voice_mode_enabled[message.chat.id] = False
+    bot.reply_to(message, "🔇 Режим изменения голоса выключен.")
+
+@bot.message_handler(commands=['pitch'])
+def set_pitch(message):
+    try:
+        parts = message.text.strip().split()
+        chat_id = message.chat.id
+        if len(parts) < 2:
+            bot.reply_to(message, f"Текущий тон: *{voice_pitch.get(chat_id, 4):+d}*\n`/pitch N` (от -12 до +12)", parse_mode="Markdown")
+            return
+        n = max(-12, min(12, int(parts[1])))
+        voice_pitch[chat_id] = n
+        bot.reply_to(message, f"🎚️ Тон: *{n:+d}* полутонов.", parse_mode="Markdown")
+    except Exception:
+        bot.reply_to(message, "❌ Использование: `/pitch N`")
+
+@bot.message_handler(content_types=['voice'])
+def handle_voice(message):
+    chat_id = message.chat.id
+    if not voice_mode_enabled.get(chat_id, False):
+        return
+    bot.reply_to(message, "🎤 Обрабатываю...")
+    semitones = voice_pitch.get(chat_id, 4)
+    threading.Thread(
+        target=change_voice_pitch,
+        args=(message, semitones),
+        daemon=True
+    ).start()
+
+# ============================================================
+#  /ИНВИЗ
+# ============================================================
+
+@bot.message_handler(commands=['инвиз'])
+def toggle_invis(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if message.chat.type == "private":
+        bot.reply_to(message, "❌ Только для групп.")
+        return
+    if chat_id not in invis_users:
+        invis_users[chat_id] = set()
+    if user_id in invis_users[chat_id]:
+        invis_users[chat_id].discard(user_id)
+        bot.reply_to(message, "👁 Видимость включена — сообщения больше не удаляются.")
+    else:
+        invis_users[chat_id].add(user_id)
+        bot.reply_to(message, "🫥 Невидимка включён — сообщения будут удаляться.")
+
+# ============================================================
+#  /ГОВОР
+# ============================================================
+
+@bot.message_handler(commands=['говор'])
+def toggle_speak(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if chat_id not in speak_users:
+        speak_users[chat_id] = set()
+    if user_id in speak_users[chat_id]:
+        speak_users[chat_id].discard(user_id)
+        bot.reply_to(message, "🔇 Режим озвучки выключен.")
+    else:
+        speak_users[chat_id].add(user_id)
+        cur = speak_voice.get(chat_id, "1")
+        name = EDGE_VOICES[cur][1]
+        bot.reply_to(
+            message,
+            f"🔊 Режим озвучки *включён*.\n"
+            f"Голос: *{name}*\n\n"
+            f"Смени голос: `/голос 1|2|3`\n"
+            f"Выключить: `/говор`",
+            parse_mode="Markdown"
+        )
+
+@bot.message_handler(commands=['голос'])
+def set_voice(message):
+    try:
+        parts = message.text.strip().split()
+        if len(parts) < 2 or parts[1] not in EDGE_VOICES:
+            bot.reply_to(
+                message,
+                "Выбор голоса:\n"
+                "`/голос 1` — Светлана (женский)\n"
+                "`/голос 2` — Дмитрий (мужской)\n"
+                "`/голос 3` — 💀 Демон (страшный, с эхом)",
+                parse_mode="Markdown"
+            )
+            return
+        chat_id = message.chat.id
+        speak_voice[chat_id] = parts[1]
+        bot.reply_to(message, f"🎙️ Голос: *{EDGE_VOICES[parts[1]][1]}*", parse_mode="Markdown")
+    except Exception:
+        bot.reply_to(message, "❌ Использование: `/голос 1|2|3`")
+
+# ============================================================
+#  МОДЕРАЦИЯ
+# ============================================================
+
 muted_users = {}
 mat_filter_enabled = {}
 last_messages = {}
@@ -290,6 +542,11 @@ def is_moderation_command(message):
         or command == "/самоуничтожение еретика"
         or command in ("/прайм", "/антипрайм", "/юрист", "/.")
         or re.fullmatch(r'/юрист\s+"[^"]+"\s*,\s*"[^"]+"', command) is not None
+        or command.startswith("/инвиз")
+        or command.startswith("/говор")
+        or command.startswith("/voice")
+        or command.startswith("/pitch")
+        or command.startswith("/голос")
     )
 
 def set_manual_ban(message, duration_minutes):
@@ -313,10 +570,6 @@ def set_manual_ban(message, duration_minutes):
         pass
     period = "навсегда" if duration_minutes is None else f"на {duration_minutes} мин."
     bot.reply_to(message, f"✅ Сообщения пользователя будут удаляться {period}.")
-
-# ============================================================
-#  ОБРАБОТЧИКИ КОМАНД
-# ============================================================
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/экстерминатус")
 def exterminate_last_user(message):
@@ -346,12 +599,9 @@ def exterminate_last_user(message):
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/.")
 def toggle_self_destruct(message):
-    try:
-        chat_id = message.chat.id
-        self_destruct_enabled[chat_id] = not self_destruct_enabled.get(chat_id, False)
-        bot.reply_to(message, random.choice(GAV_VARIANTS))
-    except Exception as e:
-        print(f"[toggle error] {e}")
+    chat_id = message.chat.id
+    self_destruct_enabled[chat_id] = not self_destruct_enabled.get(chat_id, False)
+    bot.reply_to(message, random.choice(GAV_VARIANTS))
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/самоуничтожение еретика")
 def self_destruct_heretic(message):
@@ -370,14 +620,9 @@ def self_destruct_heretic(message):
             "Напиши короткую философскую речь-прощание от Маши. 3–4 предложения.\n\n"
             f"Контекст:\n{context_text[:1800]}"
         )
-        farewell = ask_openrouter(
-            "Ты Маша — философский голос бота.",
-            farewell_prompt,
-            max_tokens=200,
-        )
+        farewell = ask_openrouter("Ты Маша — философский голос бота.", farewell_prompt, max_tokens=200)
         if not farewell:
-            farewell = ("Каждая группа однажды подходит к границе, за которой слова "
-                        "становятся выбором. Я ухожу, оставляя вам тишину.")
+            farewell = "Каждая группа однажды подходит к границе. Я ухожу, оставляя вам тишину."
         bot.send_message(message.chat.id, farewell)
         bot.leave_chat(message.chat.id)
     except Exception as e:
@@ -415,17 +660,14 @@ def perform_manual_unban(message):
 
 @bot.message_handler(func=lambda msg: msg.text and re.fullmatch(r"/разбан[^\w\s]*", msg.text.lower().strip()))
 def handle_manual_unban(message):
-    try:
-        chat_id = message.chat.id
-        user_id = message.from_user.id
-        used_by_users = used_unban_words.setdefault(chat_id, set())
-        if user_id in used_by_users:
-            bot.reply_to(message, "это слово временно не работает, напишите писюнец.")
-            return
-        if perform_manual_unban(message):
-            used_by_users.add(user_id)
-    except Exception as e:
-        print(f"[unban error] {e}")
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    used_by_users = used_unban_words.setdefault(chat_id, set())
+    if user_id in used_by_users:
+        bot.reply_to(message, "это слово временно не работает, напишите писюнец.")
+        return
+    if perform_manual_unban(message):
+        used_by_users.add(user_id)
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/йода")
 def handle_hidden_unban(message):
@@ -444,79 +686,76 @@ def get_lawyer_names(message):
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/прайм")
 def enable_prime_mode(message):
-    try:
-        chat_id = message.chat.id
-        chat_modes[chat_id] = "prime"
-        lawyer_profiles.pop(chat_id, None)
-        lawyer_avatar_chats.discard(chat_id)
-        update_lawyer_avatar()
-        bot.reply_to(message, "🧠 Прайм-режим включён. Теперь я отвечаю как нейросеть.")
-    except Exception as e:
-        print(f"[prime error] {e}")
+    chat_id = message.chat.id
+    chat_modes[chat_id] = "prime"
+    lawyer_profiles.pop(chat_id, None)
+    lawyer_avatar_chats.discard(chat_id)
+    update_lawyer_avatar()
+    bot.reply_to(message, "🧠 Прайм-режим включён. Теперь я отвечаю как нейросеть.")
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/антипрайм")
 def disable_prime_mode(message):
-    try:
-        chat_id = message.chat.id
+    chat_id = message.chat.id
+    chat_modes.pop(chat_id, None)
+    lawyer_profiles.pop(chat_id, None)
+    lawyer_avatar_chats.discard(chat_id)
+    update_lawyer_avatar()
+    bot.reply_to(message, random.choice(GAV_VARIANTS))
+
+@bot.message_handler(func=lambda msg: msg.text and get_lawyer_names(msg) is not None)
+def toggle_lawyer_mode(message):
+    chat_id = message.chat.id
+    if chat_id in lawyer_profiles:
         chat_modes.pop(chat_id, None)
         lawyer_profiles.pop(chat_id, None)
         lawyer_avatar_chats.discard(chat_id)
         update_lawyer_avatar()
         bot.reply_to(message, random.choice(GAV_VARIANTS))
-    except Exception as e:
-        print(f"[anti-prime error] {e}")
-
-@bot.message_handler(func=lambda msg: msg.text and get_lawyer_names(msg) is not None)
-def toggle_lawyer_mode(message):
-    try:
-        chat_id = message.chat.id
-        if chat_id in lawyer_profiles:
-            chat_modes.pop(chat_id, None)
-            lawyer_profiles.pop(chat_id, None)
-            lawyer_avatar_chats.discard(chat_id)
-            update_lawyer_avatar()
-            bot.reply_to(message, random.choice(GAV_VARIANTS))
-            return
-        last_message = last_messages.get(chat_id)
-        if not last_message:
-            bot.reply_to(message, "❌ Не найден пользователь.")
-            return
-        protected_name, defender_name = get_lawyer_names(message)
-        target_user_id, _ = last_message
-        lawyer_profiles[chat_id] = {
-            "protected_user_id": message.from_user.id,
-            "defender_user_id": target_user_id,
-            "protected_name": protected_name or message.from_user.first_name,
-            "defender_name": defender_name or last_message_names.get(chat_id, "оппонент"),
-        }
-        chat_modes[chat_id] = "lawyer"
-        lawyer_avatar_chats.add(chat_id)
-        update_lawyer_avatar()
-        bot.reply_to(message, f"⚖️ Режим юриста включён.")
-    except Exception as e:
-        print(f"[lawyer error] {e}")
+        return
+    last_message = last_messages.get(chat_id)
+    if not last_message:
+        bot.reply_to(message, "❌ Не найден пользователь.")
+        return
+    protected_name, defender_name = get_lawyer_names(message)
+    target_user_id, _ = last_message
+    lawyer_profiles[chat_id] = {
+        "protected_user_id": message.from_user.id,
+        "defender_user_id": target_user_id,
+        "protected_name": protected_name or message.from_user.first_name,
+        "defender_name": defender_name or last_message_names.get(chat_id, "оппонент"),
+    }
+    chat_modes[chat_id] = "lawyer"
+    lawyer_avatar_chats.add(chat_id)
+    update_lawyer_avatar()
+    bot.reply_to(message, "⚖️ Режим юриста включён.")
 
 @bot.message_handler(commands=['мат+'])
 def enable_mat_filter(message):
-    try:
-        mat_filter_enabled[message.chat.id] = True
-        bot.reply_to(message, "✅ Мат-фильтр **включён**.", parse_mode="Markdown")
-    except Exception as e:
-        print(f"[mat+ error] {e}")
+    mat_filter_enabled[message.chat.id] = True
+    bot.reply_to(message, "✅ Мат-фильтр включён.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['мат-'])
 def disable_mat_filter(message):
-    try:
-        mat_filter_enabled[message.chat.id] = False
-        bot.reply_to(message, "❌ Мат-фильтр **отключён**.", parse_mode="Markdown")
-    except Exception as e:
-        print(f"[mat- error] {e}")
+    mat_filter_enabled[message.chat.id] = False
+    bot.reply_to(message, "❌ Мат-фильтр отключён.", parse_mode="Markdown")
+
+# ============================================================
+#  ГЛАВНЫЙ ОБРАБОТЧИК
+# ============================================================
 
 @bot.message_handler(func=lambda msg: True)
 def count_messages(message):
     try:
         chat_id = message.chat.id
         user_id = message.from_user.id
+
+        # /инвиз — удаляем сообщение
+        if chat_id in invis_users and user_id in invis_users[chat_id]:
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except Exception:
+                pass
+
         if not is_moderation_command(message):
             last_messages[chat_id] = (user_id, message.message_id)
             last_message_names[chat_id] = (message.from_user.first_name or message.from_user.username or str(user_id))
@@ -550,7 +789,7 @@ def count_messages(message):
                     muted_users[chat_id] = {}
                 muted_users[chat_id][user_id] = until_time
                 try:
-                    warning = bot.send_message(chat_id, f"⚠️ Пользователь {message.from_user.first_name} использовал запрещённое слово. Все его сообщения будут удаляться в течение 1 минуты.")
+                    warning = bot.send_message(chat_id, f"⚠️ {message.from_user.first_name} использовал запрещённое слово. Сообщения удаляются 1 минуту.")
                     def delete_warning():
                         time.sleep(5)
                         try:
@@ -562,19 +801,29 @@ def count_messages(message):
                     pass
                 return
 
+        # /говор — озвучка
+        if chat_id in speak_users and user_id in speak_users[chat_id] and message.text:
+            text = message.text.strip()
+            if text and not text.startswith('/'):
+                vk = speak_voice.get(chat_id, "1")
+                voice = EDGE_VOICES[vk][0]
+                threading.Thread(
+                    target=speak_text_in_chat,
+                    args=(chat_id, text, user_id, message.message_id, voice, vk),
+                    daemon=True
+                ).start()
+                return
+
         mode = chat_modes.get(chat_id)
         if mode == "prime":
             user_text = message.text or "Пользователь отправил сообщение без текста."
             identity_reply = get_bot_identity_reply(user_text)
-
             if identity_reply:
                 bot.reply_to(message, identity_reply)
                 return
-
             send_ai_reply(
                 message,
-                ("Ты дружелюбная нейросеть внутри Telegram-бота. "
-                 "Отвечай на русском языке кратко, максимум тремя короткими предложениями, по делу."),
+                "Ты дружелюбная нейросеть. Отвечай на русском, максимум тремя короткими предложениями.",
                 user_text,
                 max_tokens=150,
             )
@@ -587,20 +836,13 @@ def count_messages(message):
                 return
             if user_id == profile["defender_user_id"]:
                 user_text = message.text or "Оппонент отправил сообщение без текста."
-                identity_reply = get_bot_identity_reply(user_text)
-                if identity_reply:
-                    bot.reply_to(message, identity_reply)
-                else:
-                    send_ai_reply(
-                        message,
-                        (f"Ты жёсткий юридический защитник пользователя "
-                         f"{profile['protected_name']} в споре с {profile['defender_name']}. "
-                         "Найди логические ошибки, манипуляции и отсутствие доказательств, "
-                         "затем дай уверенное юридическое возражение. Не выдумывай статьи и законы. "
-                         "Отвечай по-русски максимум тремя короткими предложениями."),
-                        user_text,
-                        max_tokens=150,
-                    )
+                send_ai_reply(
+                    message,
+                    (f"Ты жёсткий юридический защитник {profile['protected_name']} в споре с "
+                     f"{profile['defender_name']}. Отвечай по-русски максимум тремя предложениями."),
+                    user_text,
+                    max_tokens=150,
+                )
             return
 
         if user_id not in user_counters:
@@ -618,7 +860,7 @@ def count_messages(message):
         print(f"[count_messages error] {e}\n{traceback.format_exc()}")
 
 # ============================================================
-#  HEALTH-CHECK ДЛЯ RELAXDEV
+#  HEALTH-CHECK
 # ============================================================
 
 def self_ping_loop():
@@ -657,7 +899,7 @@ def run_bot():
 
 if __name__ == "__main__":
     if not OPENROUTER_API_KEY or "вставь_свой_ключ" in OPENROUTER_API_KEY:
-        print("⚠️ OPENROUTER_API_KEY не задан в коде! Вставь ключ в переменную OPENROUTER_API_KEY.")
+        print("⚠️ OPENROUTER_API_KEY не задан в коде!")
 
     health_thread = threading.Thread(target=run_health, daemon=True)
     health_thread.start()
