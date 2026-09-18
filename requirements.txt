@@ -3,3 +3,4 @@ requests
 librosa
 soundfile
 static-ffmpeg
+edge-tts
