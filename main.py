@@ -9,8 +9,6 @@ import traceback
 import requests
 import subprocess
 import asyncio
-import librosa
-import soundfile as sf
 import edge_tts
 from telebot import types
 from datetime import datetime, timedelta
@@ -18,6 +16,37 @@ from urllib import request as urllib_request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 TOKEN = os.environ.get('BOT_TOKEN')
+
+# ============================================================
+#  FFMPEG — через static-ffmpeg (100% рабочий способ)
+# ============================================================
+FFMPEG_PATH = "ffmpeg"
+
+try:
+    from static_ffmpeg import run as _sff_run
+    _ffmpeg_bin, _ffprobe_bin = _sff_run.get_or_fetch_platform_executables_else_raise()
+    FFMPEG_PATH = _ffmpeg_bin
+    print(f"[ffmpeg] OK: {FFMPEG_PATH}")
+except Exception as e:
+    print(f"[ffmpeg] static-ffmpeg не сработал: {e}")
+    # Fallback — пробуем найти в системе
+    for candidate in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/app/ffmpeg"]:
+        if os.path.exists(candidate):
+            FFMPEG_PATH = candidate
+            print(f"[ffmpeg] найден в системе: {FFMPEG_PATH}")
+            break
+
+# ============================================================
+#  LIBROSA — импорт в try (если упадёт — голосовой режим отключится, бот не умрёт)
+# ============================================================
+try:
+    import librosa
+    import soundfile as sf
+    LIBROSA_OK = True
+    print("[librosa] OK")
+except Exception as e:
+    LIBROSA_OK = False
+    print(f"[librosa] не загрузилась: {e}")
 
 # ============================================================
 #  OPENROUTER
@@ -40,8 +69,6 @@ def _safe_reply_to(message, text, **kwargs):
             return None
 
 bot.reply_to = _safe_reply_to
-
-FFMPEG_PATH = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True).stdout.strip() or "ffmpeg"
 
 # ============================================================
 #  СОСТОЯНИЕ
@@ -262,18 +289,16 @@ def tts_generate(text, output_mp3, voice="ru-RU-SvetlanaNeural"):
     asyncio.run(_run())
 
 def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-SvetlanaNeural", voice_key="1"):
-    """Озвучивает текст. Если voice_key == '3' — добавляет страшные эффекты."""
     try:
         ts = int(time.time() * 1000)
         mp3_path = f"/tmp/tts_{chat_id}_{ts}.mp3"
         ogg_path = f"/tmp/tts_{chat_id}_{ts}.ogg"
 
-        # 1. Генерируем базовый голос
+        # 1. Генерируем MP3 через edge-tts
         tts_generate(text[:500], mp3_path, voice)
 
-        # 2. Конвертация в OGG/Opus. Для голоса 3 — страшные фильтры
+        # 2. Конвертим в OGG/Opus. Для голоса 3 — страшные фильтры
         if voice_key == "3":
-            # Понижаем тон (asetrate) + двойное эхо (aecho)
             filter_chain = (
                 "asetrate=44100*0.75,atempo=1.333,"
                 "aecho=0.8:0.9:60|180:0.4|0.25,"
@@ -284,13 +309,13 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
                 '-filter:a', filter_chain,
                 '-c:a', 'libopus', '-b:a', '64k',
                 ogg_path, '-y'
-            ], capture_output=True)
+            ], capture_output=True, timeout=60)
         else:
             subprocess.run([
                 FFMPEG_PATH, '-i', mp3_path,
                 '-c:a', 'libopus', '-b:a', '64k',
                 ogg_path, '-y'
-            ], capture_output=True)
+            ], capture_output=True, timeout=60)
 
         # 3. Отправляем
         with open(ogg_path, 'rb') as f:
@@ -306,17 +331,23 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
             except Exception:
                 pass
     except Exception as e:
-        print(f"[tts error] {e}")
+        print(f"[tts error] {e}\n{traceback.format_exc()}")
         try:
-            bot.send_message(chat_id, f"⚠️ Не удалось озвучить: {str(e)[:150]}")
+            bot.send_message(chat_id, f"⚠️ Ошибка озвучки: {str(e)[:150]}")
         except Exception:
             pass
 
 # ============================================================
-#  ИЗМЕНЕНИЕ ТОНА ГОЛОСОВОГО
+#  ИЗМЕНЕНИЕ ТОНА
 # ============================================================
 
 def change_voice_pitch(message, semitones=4):
+    if not LIBROSA_OK:
+        try:
+            bot.reply_to(message, "❌ Режим изменения голоса недоступен (librosa не загрузилась).")
+        except Exception:
+            pass
+        return
     try:
         file_info = bot.get_file(message.voice.file_id)
         downloaded = requests.get(
@@ -335,7 +366,7 @@ def change_voice_pitch(message, semitones=4):
         subprocess.run([
             FFMPEG_PATH, '-i', input_path,
             '-ar', '22050', '-ac', '1', wav_path, '-y'
-        ], capture_output=True)
+        ], capture_output=True, timeout=60)
 
         y, sr = librosa.load(wav_path, sr=22050)
         y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
@@ -344,7 +375,7 @@ def change_voice_pitch(message, semitones=4):
         subprocess.run([
             FFMPEG_PATH, '-i', out_wav,
             '-c:a', 'libopus', '-b:a', '64k', out_ogg, '-y'
-        ], capture_output=True)
+        ], capture_output=True, timeout=60)
 
         with open(out_ogg, 'rb') as f:
             try:
@@ -360,7 +391,10 @@ def change_voice_pitch(message, semitones=4):
                 pass
     except Exception as e:
         print(f"[pitch error] {e}")
-        bot.reply_to(message, f"❌ Ошибка: {str(e)[:200]}")
+        try:
+            bot.reply_to(message, f"❌ Ошибка: {str(e)[:200]}")
+        except Exception:
+            pass
 
 # ============================================================
 #  КОМАНДЫ ГОЛОСА
@@ -749,7 +783,7 @@ def count_messages(message):
         chat_id = message.chat.id
         user_id = message.from_user.id
 
-        # /инвиз — удаляем сообщение
+        # /инвиз
         if chat_id in invis_users and user_id in invis_users[chat_id]:
             try:
                 bot.delete_message(chat_id, message.message_id)
@@ -801,7 +835,7 @@ def count_messages(message):
                     pass
                 return
 
-        # /говор — озвучка
+        # /говор
         if chat_id in speak_users and user_id in speak_users[chat_id] and message.text:
             text = message.text.strip()
             if text and not text.startswith('/'):
