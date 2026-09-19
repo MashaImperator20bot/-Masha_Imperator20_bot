@@ -18,10 +18,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 TOKEN = os.environ.get('BOT_TOKEN')
 
 # ============================================================
-#  FFMPEG — через static-ffmpeg (100% рабочий способ)
+#  FFMPEG
 # ============================================================
 FFMPEG_PATH = "ffmpeg"
-
 try:
     from static_ffmpeg import run as _sff_run
     _ffmpeg_bin, _ffprobe_bin = _sff_run.get_or_fetch_platform_executables_else_raise()
@@ -29,16 +28,12 @@ try:
     print(f"[ffmpeg] OK: {FFMPEG_PATH}")
 except Exception as e:
     print(f"[ffmpeg] static-ffmpeg не сработал: {e}")
-    # Fallback — пробуем найти в системе
     for candidate in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/app/ffmpeg"]:
         if os.path.exists(candidate):
             FFMPEG_PATH = candidate
-            print(f"[ffmpeg] найден в системе: {FFMPEG_PATH}")
+            print(f"[ffmpeg] найден: {FFMPEG_PATH}")
             break
 
-# ============================================================
-#  LIBROSA — импорт в try (если упадёт — голосовой режим отключится, бот не умрёт)
-# ============================================================
 try:
     import librosa
     import soundfile as sf
@@ -79,11 +74,56 @@ invis_users = {}
 speak_users = {}
 speak_voice = {}
 
+muted_users = {}
+banan_users = {}
+chat_user_usernames = {}
+chat_music = {}
+
 EDGE_VOICES = {
     "1": ("ru-RU-SvetlanaNeural", "Светлана (женский)"),
     "2": ("ru-RU-DmitryNeural", "Дмитрий (мужской)"),
-    "3": ("ru-RU-DmitryNeural", "💀 Демон (страшный, с эхом)"),
+    "3": ("ru-RU-DmitryNeural", "💀 Демон (страшный + музыка)"),
 }
+
+MUSIC_CACHE = {}
+
+def get_music_file(preset):
+    """Генерирует зловещую фоновую музыку через ffmpeg и кэширует."""
+    if preset in MUSIC_CACHE and os.path.exists(MUSIC_CACHE[preset]):
+        return MUSIC_CACHE[preset]
+
+    path = f"/tmp/deathnote_music_{preset}.wav"
+
+    if preset == 1:
+        expr = "0.25*sin(2*PI*55*t)+0.18*sin(2*PI*110*t)+0.12*sin(2*PI*164.81*t)"
+        af = "aecho=0.7:0.8:200|400:0.4|0.3,volume=0.7"
+    elif preset == 2:
+        expr = ("0.22*sin(2*PI*(146.83+8*sin(2*PI*0.4*t))*t)"
+                "+0.16*sin(2*PI*(220+12*sin(2*PI*0.6*t))*t)"
+                "+0.12*sin(2*PI*293.66*t)")
+        af = "aecho=0.6:0.75:250|500:0.5|0.35,volume=0.7"
+    elif preset == 3:
+        expr = ("0.13*sin(2*PI*98*t)+0.13*sin(2*PI*123.47*t)"
+                "+0.13*sin(2*PI*146.83*t)+0.13*sin(2*PI*196*t)"
+                "+0.10*sin(2*PI*246.94*t)")
+        af = "aecho=0.8:0.85:400|800|1600:0.4|0.3|0.2,volume=0.65"
+    else:
+        return None
+
+    try:
+        subprocess.run([
+            FFMPEG_PATH, '-f', 'lavfi',
+            '-i', f'aevalsrc={expr}:d=180:s=22050',
+            '-af', af,
+            path, '-y'
+        ], capture_output=True, timeout=30)
+
+        if os.path.exists(path):
+            MUSIC_CACHE[preset] = path
+            return path
+    except Exception as e:
+        print(f"[music error] {e}")
+    return None
 
 # ============================================================
 #  МАТ-ФИЛЬТР
@@ -227,6 +267,37 @@ def limit_sentences(text, n=3):
     return " ".join(p.strip() for p in parts[:n]).strip()
 
 # ============================================================
+#  ПРОВЕРКА МУТА / БАНАНА
+# ============================================================
+
+def is_user_muted(message):
+    try:
+        chat_id = message.chat.id
+        user_id = message.from_user.id
+        now = datetime.now()
+
+        if chat_id in muted_users and user_id in muted_users[chat_id]:
+            until_time = muted_users[chat_id][user_id]
+            if until_time is None or now < until_time:
+                return True
+            else:
+                del muted_users[chat_id][user_id]
+                if not muted_users[chat_id]:
+                    del muted_users[chat_id]
+
+        if chat_id in banan_users and user_id in banan_users[chat_id]:
+            until_time = banan_users[chat_id][user_id]
+            if now < until_time:
+                return True
+            else:
+                del banan_users[chat_id][user_id]
+                if not banan_users[chat_id]:
+                    del banan_users[chat_id]
+    except Exception:
+        pass
+    return False
+
+# ============================================================
 #  OPENROUTER
 # ============================================================
 
@@ -279,7 +350,7 @@ def send_ai_reply(message, system_prompt, user_text, max_tokens=120):
     threading.Thread(target=worker, daemon=True).start()
 
 # ============================================================
-#  TTS (EDGE-TTS)
+#  TTS
 # ============================================================
 
 def tts_generate(text, output_mp3, voice="ru-RU-SvetlanaNeural"):
@@ -294,30 +365,56 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
         mp3_path = f"/tmp/tts_{chat_id}_{ts}.mp3"
         ogg_path = f"/tmp/tts_{chat_id}_{ts}.ogg"
 
-        # 1. Генерируем MP3 через edge-tts
         tts_generate(text[:500], mp3_path, voice)
 
-        # 2. Конвертим в OGG/Opus. Для голоса 3 — страшные фильтры
+        voice_filter = None
         if voice_key == "3":
-            filter_chain = (
-                "asetrate=44100*0.75,atempo=1.333,"
-                "aecho=0.8:0.9:60|180:0.4|0.25,"
-                "aecho=0.6:0.7:400:0.3"
+            voice_filter = (
+                "aresample=44100,"
+                "asetrate=44100*0.7,atempo=1.4286,"
+                "aecho=0.8:0.88:60|180:0.4|0.35,"
+                "aecho=0.7:0.8:400:0.35,"
+                "aecho=0.6:0.7:900:0.25"
             )
-            subprocess.run([
-                FFMPEG_PATH, '-i', mp3_path,
-                '-filter:a', filter_chain,
-                '-c:a', 'libopus', '-b:a', '64k',
-                ogg_path, '-y'
-            ], capture_output=True, timeout=60)
-        else:
-            subprocess.run([
-                FFMPEG_PATH, '-i', mp3_path,
-                '-c:a', 'libopus', '-b:a', '64k',
-                ogg_path, '-y'
-            ], capture_output=True, timeout=60)
 
-        # 3. Отправляем
+        music_preset = chat_music.get(chat_id, 0)
+        music_path = get_music_file(music_preset) if music_preset else None
+
+        if music_path and os.path.exists(music_path):
+            if voice_filter:
+                filter_complex = (
+                    f"[0:a]{voice_filter}[v];"
+                    "[1:a]volume=0.22[m];"
+                    "[v][m]amix=inputs=2:duration=first:dropout_transition=2[vout]"
+                )
+            else:
+                filter_complex = (
+                    "[0:a]volume=1.0[v];"
+                    "[1:a]volume=0.22[m];"
+                    "[v][m]amix=inputs=2:duration=first:dropout_transition=2[vout]"
+                )
+            subprocess.run([
+                FFMPEG_PATH, '-i', mp3_path, '-i', music_path,
+                '-filter_complex', filter_complex,
+                '-map', '[vout]',
+                '-c:a', 'libopus', '-b:a', '64k',
+                ogg_path, '-y'
+            ], capture_output=True, timeout=90)
+        else:
+            if voice_filter:
+                subprocess.run([
+                    FFMPEG_PATH, '-i', mp3_path,
+                    '-filter:a', voice_filter,
+                    '-c:a', 'libopus', '-b:a', '64k',
+                    ogg_path, '-y'
+                ], capture_output=True, timeout=60)
+            else:
+                subprocess.run([
+                    FFMPEG_PATH, '-i', mp3_path,
+                    '-c:a', 'libopus', '-b:a', '64k',
+                    ogg_path, '-y'
+                ], capture_output=True, timeout=60)
+
         with open(ogg_path, 'rb') as f:
             try:
                 bot.send_voice(chat_id, f, reply_to_message_id=reply_to_id)
@@ -326,10 +423,8 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
                 bot.send_voice(chat_id, f)
 
         for p in [mp3_path, ogg_path]:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+            try: os.remove(p)
+            except Exception: pass
     except Exception as e:
         print(f"[tts error] {e}\n{traceback.format_exc()}")
         try:
@@ -338,7 +433,7 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
             pass
 
 # ============================================================
-#  ИЗМЕНЕНИЕ ТОНА
+#  ИЗМЕНЕНИЕ ТОНА (теперь с музыкой)
 # ============================================================
 
 def change_voice_pitch(message, semitones=4):
@@ -349,33 +444,73 @@ def change_voice_pitch(message, semitones=4):
             pass
         return
     try:
-        file_info = bot.get_file(message.voice.file_id)
-        downloaded = requests.get(
-            f'https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}'
-        )
-
         ts = int(time.time() * 1000)
         input_path = f"/tmp/in_{ts}.ogg"
         wav_path = f"/tmp/in_{ts}.wav"
         out_wav = f"/tmp/out_{ts}.wav"
         out_ogg = f"/tmp/out_{ts}.ogg"
 
+        # Скачиваем с retry
+        try:
+            file_info = bot.get_file(message.voice.file_id)
+        except Exception as e:
+            print(f"[file info error] {e}")
+            bot.reply_to(message, "❌ Не удалось получить файл. Попробуй ещё раз.")
+            return
+
+        url = f'https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}'
+        downloaded = None
+        for attempt in range(3):
+            try:
+                downloaded = requests.get(url, timeout=60)
+                if downloaded.status_code == 200:
+                    break
+            except Exception as e:
+                print(f"[download attempt {attempt+1}] {e}")
+                time.sleep(2)
+
+        if downloaded is None or downloaded.status_code != 200:
+            bot.reply_to(message, "❌ Не удалось скачать голосовое. Попробуй ещё раз.")
+            return
+
         with open(input_path, 'wb') as f:
             f.write(downloaded.content)
 
+        # OGG → WAV
         subprocess.run([
             FFMPEG_PATH, '-i', input_path,
             '-ar', '22050', '-ac', '1', wav_path, '-y'
         ], capture_output=True, timeout=60)
 
+        # Меняем тон
         y, sr = librosa.load(wav_path, sr=22050)
         y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
         sf.write(out_wav, y_shifted, sr)
 
-        subprocess.run([
-            FFMPEG_PATH, '-i', out_wav,
-            '-c:a', 'libopus', '-b:a', '64k', out_ogg, '-y'
-        ], capture_output=True, timeout=60)
+        # Проверяем музыку
+        chat_id = message.chat.id
+        music_preset = chat_music.get(chat_id, 0)
+        music_path = get_music_file(music_preset) if music_preset else None
+
+        if music_path and os.path.exists(music_path):
+            # Миксуем голос + музыку
+            filter_complex = (
+                "[0:a]volume=1.0[v];"
+                "[1:a]volume=0.22[m];"
+                "[v][m]amix=inputs=2:duration=first:dropout_transition=2[vout]"
+            )
+            subprocess.run([
+                FFMPEG_PATH, '-i', out_wav, '-i', music_path,
+                '-filter_complex', filter_complex,
+                '-map', '[vout]',
+                '-c:a', 'libopus', '-b:a', '64k',
+                out_ogg, '-y'
+            ], capture_output=True, timeout=90)
+        else:
+            subprocess.run([
+                FFMPEG_PATH, '-i', out_wav,
+                '-c:a', 'libopus', '-b:a', '64k', out_ogg, '-y'
+            ], capture_output=True, timeout=60)
 
         with open(out_ogg, 'rb') as f:
             try:
@@ -385,10 +520,8 @@ def change_voice_pitch(message, semitones=4):
                 bot.send_voice(message.chat.id, f)
 
         for p in [input_path, wav_path, out_wav, out_ogg]:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+            try: os.remove(p)
+            except Exception: pass
     except Exception as e:
         print(f"[pitch error] {e}")
         try:
@@ -402,6 +535,10 @@ def change_voice_pitch(message, semitones=4):
 
 @bot.message_handler(commands=['voice'])
 def enable_voice_mode(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     voice_mode_enabled[chat_id] = True
     voice_pitch.setdefault(chat_id, 4)
@@ -416,11 +553,19 @@ def enable_voice_mode(message):
 
 @bot.message_handler(commands=['voice_off'])
 def disable_voice_mode(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     voice_mode_enabled[message.chat.id] = False
     bot.reply_to(message, "🔇 Режим изменения голоса выключен.")
 
 @bot.message_handler(commands=['pitch'])
 def set_pitch(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     try:
         parts = message.text.strip().split()
         chat_id = message.chat.id
@@ -435,16 +580,16 @@ def set_pitch(message):
 
 @bot.message_handler(content_types=['voice'])
 def handle_voice(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     if not voice_mode_enabled.get(chat_id, False):
         return
     bot.reply_to(message, "🎤 Обрабатываю...")
     semitones = voice_pitch.get(chat_id, 4)
-    threading.Thread(
-        target=change_voice_pitch,
-        args=(message, semitones),
-        daemon=True
-    ).start()
+    threading.Thread(target=change_voice_pitch, args=(message, semitones), daemon=True).start()
 
 # ============================================================
 #  /ИНВИЗ
@@ -452,6 +597,10 @@ def handle_voice(message):
 
 @bot.message_handler(commands=['инвиз'])
 def toggle_invis(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     user_id = message.from_user.id
     if message.chat.type == "private":
@@ -461,10 +610,10 @@ def toggle_invis(message):
         invis_users[chat_id] = set()
     if user_id in invis_users[chat_id]:
         invis_users[chat_id].discard(user_id)
-        bot.reply_to(message, "👁 Видимость включена — сообщения больше не удаляются.")
+        bot.reply_to(message, "👁 Видимость включена.")
     else:
         invis_users[chat_id].add(user_id)
-        bot.reply_to(message, "🫥 Невидимка включён — сообщения будут удаляться.")
+        bot.reply_to(message, "🫥 Невидимка включён.")
 
 # ============================================================
 #  /ГОВОР
@@ -472,6 +621,10 @@ def toggle_invis(message):
 
 @bot.message_handler(commands=['говор'])
 def toggle_speak(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     user_id = message.from_user.id
     if chat_id not in speak_users:
@@ -483,17 +636,23 @@ def toggle_speak(message):
         speak_users[chat_id].add(user_id)
         cur = speak_voice.get(chat_id, "1")
         name = EDGE_VOICES[cur][1]
+        mus = chat_music.get(chat_id, 0)
+        mus_text = f"\n🎵 Музыка: {mus}" if mus else "\n🔇 Музыка выключена"
         bot.reply_to(
             message,
             f"🔊 Режим озвучки *включён*.\n"
-            f"Голос: *{name}*\n\n"
+            f"Голос: *{name}*{mus_text}\n\n"
             f"Смени голос: `/голос 1|2|3`\n"
-            f"Выключить: `/говор`",
+            f"Музыка: `/+муз1`, `/+муз2`, `/+муз3`",
             parse_mode="Markdown"
         )
 
 @bot.message_handler(commands=['голос'])
 def set_voice(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     try:
         parts = message.text.strip().split()
         if len(parts) < 2 or parts[1] not in EDGE_VOICES:
@@ -502,21 +661,169 @@ def set_voice(message):
                 "Выбор голоса:\n"
                 "`/голос 1` — Светлана (женский)\n"
                 "`/голос 2` — Дмитрий (мужской)\n"
-                "`/голос 3` — 💀 Демон (страшный, с эхом)",
+                "`/голос 3` — 💀 Демон (страшный + музыка)",
                 parse_mode="Markdown"
             )
             return
         chat_id = message.chat.id
         speak_voice[chat_id] = parts[1]
-        bot.reply_to(message, f"🎙️ Голос: *{EDGE_VOICES[parts[1]][1]}*", parse_mode="Markdown")
-    except Exception:
+        vk = parts[1]
+
+        if vk == "3":
+            chat_music[chat_id] = 3
+            msg = (
+                f"🎙️ Голос: *{EDGE_VOICES[vk][1]}*\n"
+                f"🎵 Музыка включена автоматически (Тёмный хор)."
+            )
+        else:
+            chat_music[chat_id] = 0
+            msg = f"🎙️ Голос: *{EDGE_VOICES[vk][1]}*\n🔇 Музыка выключена."
+
+        bot.reply_to(message, msg, parse_mode="Markdown")
+    except Exception as e:
+        print(f"[set voice error] {e}")
         bot.reply_to(message, "❌ Использование: `/голос 1|2|3`")
+
+# ============================================================
+#  МУЗЫКА
+# ============================================================
+
+@bot.message_handler(func=lambda m: m.text and m.text.strip().lower() in ('/+муз1', '/+муз2', '/+муз3'))
+def toggle_music(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
+    try:
+        preset = int(message.text.strip()[-1])
+        chat_id = message.chat.id
+        current = chat_music.get(chat_id, 0)
+        if current == preset:
+            chat_music[chat_id] = 0
+            bot.reply_to(message, f"🔇 Музыка {preset} выключена.")
+        else:
+            chat_music[chat_id] = preset
+            names = {1: "Зловещий орган", 2: "Тревожная мелодия", 3: "Тёмный хор"}
+            bot.reply_to(
+                message,
+                f"🎵 *Музыка {preset}* ({names[preset]}) включена.\n"
+                f"Играет в фоне: при `/говор` (озвучка текста) и при `/voice` (изменение голосового).",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        print(f"[music toggle error] {e}")
+
+# ============================================================
+#  БАНАН
+# ============================================================
+
+@bot.message_handler(commands=['банан'])
+def handle_banan(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
+    try:
+        if not is_chat_admin(message):
+            bot.reply_to(message, "❌ Только для администраторов чата.")
+            return
+
+        chat_id = message.chat.id
+        target_id = None
+        target_name = None
+
+        if message.reply_to_message:
+            target_id = message.reply_to_message.from_user.id
+            target_name = message.reply_to_message.from_user.first_name or str(target_id)
+
+        if not target_id:
+            parts = message.text.strip().split()
+            username = None
+            for p in parts[1:]:
+                if p.startswith('@'):
+                    username = p[1:].lower()
+                    break
+                elif not p.isdigit():
+                    username = p.lower()
+                    break
+
+            if username:
+                if chat_id in chat_user_usernames:
+                    target_id = chat_user_usernames[chat_id].get(username)
+                if not target_id:
+                    try:
+                        chat_info = bot.get_chat(f"@{username}")
+                        target_id = chat_info.id
+                        target_name = chat_info.first_name or username
+                    except Exception:
+                        pass
+
+        if not target_id:
+            bot.reply_to(
+                message,
+                "❌ Использование: `/банан @username` (или ответом на сообщение)",
+                parse_mode="Markdown"
+            )
+            return
+
+        if not target_name:
+            target_name = str(target_id)
+
+        until = datetime.now() + timedelta(hours=24)
+        if chat_id not in banan_users:
+            banan_users[chat_id] = {}
+        banan_users[chat_id][target_id] = until
+
+        if message.reply_to_message:
+            try:
+                bot.delete_message(chat_id, message.reply_to_message.message_id)
+            except Exception:
+                pass
+
+        bot.reply_to(
+            message,
+            f"🍌 *{target_name}* отправлен в банан на 24 часа.\n"
+            f"Снять: `/антибананан`",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"[banan error] {e}")
+
+@bot.message_handler(commands=['антибананан'])
+def handle_antibanan(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
+    try:
+        if not is_chat_admin(message):
+            bot.reply_to(message, "❌ Только для администраторов чата.")
+            return
+
+        chat_id = message.chat.id
+
+        if chat_id not in banan_users or not banan_users[chat_id]:
+            bot.reply_to(message, "🍌 Некуда снимать банан.")
+            return
+
+        if message.reply_to_message:
+            target_id = message.reply_to_message.from_user.id
+            if target_id in banan_users[chat_id]:
+                del banan_users[chat_id][target_id]
+                bot.reply_to(message, "🍌 Банан снят.")
+            else:
+                bot.reply_to(message, "❌ У этого пользователя нет банана.")
+            return
+
+        banan_users[chat_id].clear()
+        bot.reply_to(message, "🍌 Все бананы сняты.")
+    except Exception as e:
+        print(f"[antibanan error] {e}")
 
 # ============================================================
 #  МОДЕРАЦИЯ
 # ============================================================
 
-muted_users = {}
 mat_filter_enabled = {}
 last_messages = {}
 last_message_names = {}
@@ -581,6 +888,9 @@ def is_moderation_command(message):
         or command.startswith("/voice")
         or command.startswith("/pitch")
         or command.startswith("/голос")
+        or command.startswith("/банан")
+        or command.startswith("/антибананан")
+        or command in ("/+муз1", "/+муз2", "/+муз3")
     )
 
 def set_manual_ban(message, duration_minutes):
@@ -608,6 +918,10 @@ def set_manual_ban(message, duration_minutes):
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/экстерминатус")
 def exterminate_last_user(message):
     try:
+        if is_user_muted(message):
+            try: bot.delete_message(message.chat.id, message.message_id)
+            except Exception: pass
+            return
         if not is_chat_admin(message):
             bot.reply_to(message, "❌ Эта команда доступна только администраторам чата.")
             return
@@ -633,6 +947,10 @@ def exterminate_last_user(message):
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/.")
 def toggle_self_destruct(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     self_destruct_enabled[chat_id] = not self_destruct_enabled.get(chat_id, False)
     bot.reply_to(message, random.choice(GAV_VARIANTS))
@@ -640,6 +958,10 @@ def toggle_self_destruct(message):
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/самоуничтожение еретика")
 def self_destruct_heretic(message):
     try:
+        if is_user_muted(message):
+            try: bot.delete_message(message.chat.id, message.message_id)
+            except Exception: pass
+            return
         if not self_destruct_enabled.get(message.chat.id, False):
             return
         if message.chat.type not in ("group", "supergroup"):
@@ -664,6 +986,10 @@ def self_destruct_heretic(message):
 
 @bot.message_handler(func=lambda msg: msg.text and re.fullmatch(r"/бан(?:1|5)?", msg.text.lower().strip()))
 def handle_manual_ban(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     try:
         command = message.text.lower().strip()
         duration_minutes = {"бан1": 1, "бан5": 5, "бан": None}[command[1:]]
@@ -694,6 +1020,10 @@ def perform_manual_unban(message):
 
 @bot.message_handler(func=lambda msg: msg.text and re.fullmatch(r"/разбан[^\w\s]*", msg.text.lower().strip()))
 def handle_manual_unban(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     user_id = message.from_user.id
     used_by_users = used_unban_words.setdefault(chat_id, set())
@@ -705,10 +1035,18 @@ def handle_manual_unban(message):
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/йода")
 def handle_hidden_unban(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     perform_manual_unban(message)
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "писюнец")
 def handle_pisyunets(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     bot.reply_to(message, "хахаха повёлся")
 
 def get_lawyer_names(message):
@@ -720,6 +1058,10 @@ def get_lawyer_names(message):
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/прайм")
 def enable_prime_mode(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     chat_modes[chat_id] = "prime"
     lawyer_profiles.pop(chat_id, None)
@@ -729,6 +1071,10 @@ def enable_prime_mode(message):
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/антипрайм")
 def disable_prime_mode(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     chat_modes.pop(chat_id, None)
     lawyer_profiles.pop(chat_id, None)
@@ -738,6 +1084,10 @@ def disable_prime_mode(message):
 
 @bot.message_handler(func=lambda msg: msg.text and get_lawyer_names(msg) is not None)
 def toggle_lawyer_mode(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     chat_id = message.chat.id
     if chat_id in lawyer_profiles:
         chat_modes.pop(chat_id, None)
@@ -765,11 +1115,19 @@ def toggle_lawyer_mode(message):
 
 @bot.message_handler(commands=['мат+'])
 def enable_mat_filter(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     mat_filter_enabled[message.chat.id] = True
     bot.reply_to(message, "✅ Мат-фильтр включён.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['мат-'])
 def disable_mat_filter(message):
+    if is_user_muted(message):
+        try: bot.delete_message(message.chat.id, message.message_id)
+        except Exception: pass
+        return
     mat_filter_enabled[message.chat.id] = False
     bot.reply_to(message, "❌ Мат-фильтр отключён.", parse_mode="Markdown")
 
@@ -783,7 +1141,11 @@ def count_messages(message):
         chat_id = message.chat.id
         user_id = message.from_user.id
 
-        # /инвиз
+        # Сохраняем username
+        if message.from_user.username:
+            chat_user_usernames.setdefault(chat_id, {})[message.from_user.username.lower()] = user_id
+
+        # /инвиз — удаляем
         if chat_id in invis_users and user_id in invis_users[chat_id]:
             try:
                 bot.delete_message(chat_id, message.message_id)
@@ -799,6 +1161,7 @@ def count_messages(message):
                 context_entries.append({"name": last_message_names[chat_id], "text": message_text[:240]})
                 del context_entries[:-8]
 
+        # Мут
         if chat_id in muted_users and user_id in muted_users[chat_id]:
             until_time = muted_users[chat_id][user_id]
             if until_time is None or datetime.now() < until_time:
@@ -812,6 +1175,21 @@ def count_messages(message):
                 if not muted_users[chat_id]:
                     del muted_users[chat_id]
 
+        # Банан
+        if chat_id in banan_users and user_id in banan_users[chat_id]:
+            until_time = banan_users[chat_id][user_id]
+            if datetime.now() < until_time:
+                try:
+                    bot.delete_message(chat_id, message.message_id)
+                except Exception:
+                    pass
+                return
+            else:
+                del banan_users[chat_id][user_id]
+                if not banan_users[chat_id]:
+                    del banan_users[chat_id]
+
+        # Мат-фильтр
         if is_filter_enabled(chat_id) and message.text:
             if contains_bad_word(message.text):
                 try:
@@ -933,7 +1311,7 @@ def run_bot():
 
 if __name__ == "__main__":
     if not OPENROUTER_API_KEY or "вставь_свой_ключ" in OPENROUTER_API_KEY:
-        print("⚠️ OPENROUTER_API_KEY не задан в коде!")
+        print("⚠️ OPENROUTER_API_KEY не задан!")
 
     health_thread = threading.Thread(target=run_health, daemon=True)
     health_thread.start()
