@@ -1,6 +1,7 @@
 import os
 import re
-import json
+import shutil
+import tarfile
 import telebot
 import random
 import threading
@@ -18,22 +19,62 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 TOKEN = os.environ.get('BOT_TOKEN')
 
 # ============================================================
-#  FFMPEG
+#  FFMPEG — ищем или скачиваем напрямую
 # ============================================================
 FFMPEG_PATH = "ffmpeg"
-try:
-    from static_ffmpeg import run as _sff_run
-    _ffmpeg_bin, _ffprobe_bin = _sff_run.get_or_fetch_platform_executables_else_raise()
-    FFMPEG_PATH = _ffmpeg_bin
-    print(f"[ffmpeg] OK: {FFMPEG_PATH}")
-except Exception as e:
-    print(f"[ffmpeg] static-ffmpeg не сработал: {e}")
-    for candidate in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/app/ffmpeg"]:
-        if os.path.exists(candidate):
-            FFMPEG_PATH = candidate
-            print(f"[ffmpeg] найден: {FFMPEG_PATH}")
-            break
 
+def _find_ffmpeg():
+    # 1. PATH
+    which = shutil.which("ffmpeg")
+    if which:
+        return which
+
+    # 2. Стандартные пути
+    for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+              "/app/ffmpeg", "/tmp/ffmpeg", os.path.expanduser("~/ffmpeg")]:
+        if os.path.exists(p):
+            return p
+
+    # 3. static_ffmpeg
+    try:
+        from static_ffmpeg import run as _sff_run
+        b, _ = _sff_run.get_or_fetch_platform_executables_else_raise()
+        if b and os.path.exists(b):
+            return b
+    except Exception as e:
+        print(f"[ffmpeg] static-ffmpeg не помог: {e}")
+
+    # 4. Скачиваем вручную
+    try:
+        url = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/"
+               "latest/ffmpeg-master-latest-linux64-gpl.tar.xz")
+        tar_path = "/tmp/ffmpeg.tar.xz"
+        extract_dir = "/tmp/ffmpeg_extract"
+
+        print("[ffmpeg] скачиваю бинарник...")
+        urllib_request.urlretrieve(url, tar_path)
+
+        os.makedirs(extract_dir, exist_ok=True)
+        with tarfile.open(tar_path, "r:xz") as tar:
+            tar.extractall(extract_dir)
+
+        for root, dirs, files in os.walk(extract_dir):
+            if "ffmpeg" in files:
+                found = os.path.join(root, "ffmpeg")
+                os.chmod(found, 0o755)
+                print(f"[ffmpeg] скачан: {found}")
+                return found
+    except Exception as e:
+        print(f"[ffmpeg] скачать не удалось: {e}")
+
+    return None
+
+FFMPEG_PATH = _find_ffmpeg() or "ffmpeg"
+print(f"[ffmpeg] итоговый путь: {FFMPEG_PATH}")
+
+# ============================================================
+#  LIBROSA
+# ============================================================
 try:
     import librosa
     import soundfile as sf
@@ -88,7 +129,6 @@ EDGE_VOICES = {
 MUSIC_CACHE = {}
 
 def get_music_file(preset):
-    """Генерирует зловещую фоновую музыку через ffmpeg и кэширует."""
     if preset in MUSIC_CACHE and os.path.exists(MUSIC_CACHE[preset]):
         return MUSIC_CACHE[preset]
 
@@ -303,7 +343,6 @@ def is_user_muted(message):
 
 def ask_openrouter(system_prompt, user_text, max_tokens=120):
     if not OPENROUTER_API_KEY or "вставь_свой_ключ" in OPENROUTER_API_KEY:
-        print("[openrouter] Ключ не задан.")
         return None
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -433,13 +472,45 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
             pass
 
 # ============================================================
-#  ИЗМЕНЕНИЕ ТОНА (теперь с музыкой)
+#  ИЗМЕНЕНИЕ ТОНА (улучшенное скачивание)
 # ============================================================
+
+def _download_telegram_file(file_id):
+    """Скачивает файл из Telegram с несколькими попытками и длинным таймаутом."""
+    last_err = None
+
+    for attempt in range(3):
+        try:
+            file_info = bot.get_file(file_id)
+            url = f'https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}'
+
+            for dl_attempt in range(3):
+                try:
+                    r = requests.get(url, timeout=120, stream=True)
+                    if r.status_code == 200:
+                        content = r.content
+                        if content and len(content) > 100:
+                            return content
+                        last_err = f"Empty file ({len(content)} bytes)"
+                    else:
+                        last_err = f"HTTP {r.status_code}"
+                except Exception as e:
+                    last_err = f"{type(e).__name__}: {str(e)[:120]}"
+                    print(f"[dl attempt {dl_attempt+1}] {last_err}")
+                    time.sleep(3)
+            break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            print(f"[get_file attempt {attempt+1}] {last_err}")
+            time.sleep(3)
+
+    return None, last_err
+
 
 def change_voice_pitch(message, semitones=4):
     if not LIBROSA_OK:
         try:
-            bot.reply_to(message, "❌ Режим изменения голоса недоступен (librosa не загрузилась).")
+            bot.reply_to(message, "❌ Режим изменения голоса недоступен.")
         except Exception:
             pass
         return
@@ -450,50 +521,35 @@ def change_voice_pitch(message, semitones=4):
         out_wav = f"/tmp/out_{ts}.wav"
         out_ogg = f"/tmp/out_{ts}.ogg"
 
-        # Скачиваем с retry
-        try:
-            file_info = bot.get_file(message.voice.file_id)
-        except Exception as e:
-            print(f"[file info error] {e}")
-            bot.reply_to(message, "❌ Не удалось получить файл. Попробуй ещё раз.")
-            return
-
-        url = f'https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}'
-        downloaded = None
-        for attempt in range(3):
+        content, err = _download_telegram_file(message.voice.file_id)
+        if content is None:
             try:
-                downloaded = requests.get(url, timeout=60)
-                if downloaded.status_code == 200:
-                    break
-            except Exception as e:
-                print(f"[download attempt {attempt+1}] {e}")
-                time.sleep(2)
-
-        if downloaded is None or downloaded.status_code != 200:
-            bot.reply_to(message, "❌ Не удалось скачать голосовое. Попробуй ещё раз.")
+                bot.reply_to(
+                    message,
+                    f"❌ Не удалось скачать голосовое:\n{err}",
+                    parse_mode=None
+                )
+            except Exception:
+                pass
             return
 
         with open(input_path, 'wb') as f:
-            f.write(downloaded.content)
+            f.write(content)
 
-        # OGG → WAV
         subprocess.run([
             FFMPEG_PATH, '-i', input_path,
             '-ar', '22050', '-ac', '1', wav_path, '-y'
         ], capture_output=True, timeout=60)
 
-        # Меняем тон
         y, sr = librosa.load(wav_path, sr=22050)
         y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
         sf.write(out_wav, y_shifted, sr)
 
-        # Проверяем музыку
         chat_id = message.chat.id
         music_preset = chat_music.get(chat_id, 0)
         music_path = get_music_file(music_preset) if music_preset else None
 
         if music_path and os.path.exists(music_path):
-            # Миксуем голос + музыку
             filter_complex = (
                 "[0:a]volume=1.0[v];"
                 "[1:a]volume=0.22[m];"
@@ -707,7 +763,7 @@ def toggle_music(message):
             bot.reply_to(
                 message,
                 f"🎵 *Музыка {preset}* ({names[preset]}) включена.\n"
-                f"Играет в фоне: при `/говор` (озвучка текста) и при `/voice` (изменение голосового).",
+                f"Работает в `/говор` и `/voice`.",
                 parse_mode="Markdown"
             )
     except Exception as e:
@@ -759,11 +815,7 @@ def handle_banan(message):
                         pass
 
         if not target_id:
-            bot.reply_to(
-                message,
-                "❌ Использование: `/банан @username` (или ответом на сообщение)",
-                parse_mode="Markdown"
-            )
+            bot.reply_to(message, "❌ Использование: `/банан @username` (или reply)", parse_mode="Markdown")
             return
 
         if not target_name:
@@ -923,12 +975,12 @@ def exterminate_last_user(message):
             except Exception: pass
             return
         if not is_chat_admin(message):
-            bot.reply_to(message, "❌ Эта команда доступна только администраторам чата.")
+            bot.reply_to(message, "❌ Только для администраторов.")
             return
         chat_id = message.chat.id
         last_message = last_messages.get(chat_id)
         if not last_message:
-            bot.reply_to(message, "❌ Пока некому назначать удаление из группы.")
+            bot.reply_to(message, "❌ Пока некому назначать удаление.")
             return
         target_user_id, _ = last_message
         bot.ban_chat_member(chat_id, target_user_id, revoke_messages=True)
@@ -965,13 +1017,13 @@ def self_destruct_heretic(message):
         if not self_destruct_enabled.get(message.chat.id, False):
             return
         if message.chat.type not in ("group", "supergroup"):
-            bot.reply_to(message, "❌ Эта команда работает только в группах.")
+            bot.reply_to(message, "❌ Только для групп.")
             return
         context_entries = chat_contexts.get(message.chat.id, [])
         if context_entries:
             context_text = "\n".join(f"{e['name']}: {e['text']}" for e in context_entries[-6:])
         else:
-            context_text = "Подробного контекста разговора нет."
+            context_text = "Подробного контекста нет."
         farewell_prompt = (
             "Напиши короткую философскую речь-прощание от Маши. 3–4 предложения.\n\n"
             f"Контекст:\n{context_text[:1800]}"
@@ -1067,7 +1119,7 @@ def enable_prime_mode(message):
     lawyer_profiles.pop(chat_id, None)
     lawyer_avatar_chats.discard(chat_id)
     update_lawyer_avatar()
-    bot.reply_to(message, "🧠 Прайм-режим включён. Теперь я отвечаю как нейросеть.")
+    bot.reply_to(message, "🧠 Прайм-режим включён.")
 
 @bot.message_handler(func=lambda msg: msg.text and msg.text.lower().strip() == "/антипрайм")
 def disable_prime_mode(message):
@@ -1120,7 +1172,7 @@ def enable_mat_filter(message):
         except Exception: pass
         return
     mat_filter_enabled[message.chat.id] = True
-    bot.reply_to(message, "✅ Мат-фильтр включён.", parse_mode="Markdown")
+    bot.reply_to(message, "✅ Мат-фильтр включён.")
 
 @bot.message_handler(commands=['мат-'])
 def disable_mat_filter(message):
@@ -1129,7 +1181,7 @@ def disable_mat_filter(message):
         except Exception: pass
         return
     mat_filter_enabled[message.chat.id] = False
-    bot.reply_to(message, "❌ Мат-фильтр отключён.", parse_mode="Markdown")
+    bot.reply_to(message, "❌ Мат-фильтр отключён.")
 
 # ============================================================
 #  ГЛАВНЫЙ ОБРАБОТЧИК
@@ -1141,11 +1193,9 @@ def count_messages(message):
         chat_id = message.chat.id
         user_id = message.from_user.id
 
-        # Сохраняем username
         if message.from_user.username:
             chat_user_usernames.setdefault(chat_id, {})[message.from_user.username.lower()] = user_id
 
-        # /инвиз — удаляем
         if chat_id in invis_users and user_id in invis_users[chat_id]:
             try:
                 bot.delete_message(chat_id, message.message_id)
@@ -1161,7 +1211,6 @@ def count_messages(message):
                 context_entries.append({"name": last_message_names[chat_id], "text": message_text[:240]})
                 del context_entries[:-8]
 
-        # Мут
         if chat_id in muted_users and user_id in muted_users[chat_id]:
             until_time = muted_users[chat_id][user_id]
             if until_time is None or datetime.now() < until_time:
@@ -1175,7 +1224,6 @@ def count_messages(message):
                 if not muted_users[chat_id]:
                     del muted_users[chat_id]
 
-        # Банан
         if chat_id in banan_users and user_id in banan_users[chat_id]:
             until_time = banan_users[chat_id][user_id]
             if datetime.now() < until_time:
@@ -1189,7 +1237,6 @@ def count_messages(message):
                 if not banan_users[chat_id]:
                     del banan_users[chat_id]
 
-        # Мат-фильтр
         if is_filter_enabled(chat_id) and message.text:
             if contains_bad_word(message.text):
                 try:
@@ -1213,7 +1260,6 @@ def count_messages(message):
                     pass
                 return
 
-        # /говор
         if chat_id in speak_users and user_id in speak_users[chat_id] and message.text:
             text = message.text.strip()
             if text and not text.startswith('/'):
@@ -1319,4 +1365,4 @@ if __name__ == "__main__":
     ping_thread.start()
 
     print("Бот запущен...")
-    run_bot()
+    run_bot() должен
