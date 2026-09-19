@@ -24,18 +24,15 @@ TOKEN = os.environ.get('BOT_TOKEN')
 FFMPEG_PATH = "ffmpeg"
 
 def _find_ffmpeg():
-    # 1. PATH
     which = shutil.which("ffmpeg")
     if which:
         return which
 
-    # 2. Стандартные пути
     for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg",
               "/app/ffmpeg", "/tmp/ffmpeg", os.path.expanduser("~/ffmpeg")]:
         if os.path.exists(p):
             return p
 
-    # 3. static_ffmpeg
     try:
         from static_ffmpeg import run as _sff_run
         b, _ = _sff_run.get_or_fetch_platform_executables_else_raise()
@@ -44,7 +41,6 @@ def _find_ffmpeg():
     except Exception as e:
         print(f"[ffmpeg] static-ffmpeg не помог: {e}")
 
-    # 4. Скачиваем вручную
     try:
         url = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/"
                "latest/ffmpeg-master-latest-linux64-gpl.tar.xz")
@@ -118,52 +114,12 @@ speak_voice = {}
 muted_users = {}
 banan_users = {}
 chat_user_usernames = {}
-chat_music = {}
 
 EDGE_VOICES = {
     "1": ("ru-RU-SvetlanaNeural", "Светлана (женский)"),
     "2": ("ru-RU-DmitryNeural", "Дмитрий (мужской)"),
-    "3": ("ru-RU-DmitryNeural", "💀 Демон (страшный + музыка)"),
+    "3": ("ru-RU-DmitryNeural", "💀 Демон (страшный)"),
 }
-
-MUSIC_CACHE = {}
-
-def get_music_file(preset):
-    if preset in MUSIC_CACHE and os.path.exists(MUSIC_CACHE[preset]):
-        return MUSIC_CACHE[preset]
-
-    path = f"/tmp/deathnote_music_{preset}.wav"
-
-    if preset == 1:
-        expr = "0.25*sin(2*PI*55*t)+0.18*sin(2*PI*110*t)+0.12*sin(2*PI*164.81*t)"
-        af = "aecho=0.7:0.8:200|400:0.4|0.3,volume=0.7"
-    elif preset == 2:
-        expr = ("0.22*sin(2*PI*(146.83+8*sin(2*PI*0.4*t))*t)"
-                "+0.16*sin(2*PI*(220+12*sin(2*PI*0.6*t))*t)"
-                "+0.12*sin(2*PI*293.66*t)")
-        af = "aecho=0.6:0.75:250|500:0.5|0.35,volume=0.7"
-    elif preset == 3:
-        expr = ("0.13*sin(2*PI*98*t)+0.13*sin(2*PI*123.47*t)"
-                "+0.13*sin(2*PI*146.83*t)+0.13*sin(2*PI*196*t)"
-                "+0.10*sin(2*PI*246.94*t)")
-        af = "aecho=0.8:0.85:400|800|1600:0.4|0.3|0.2,volume=0.65"
-    else:
-        return None
-
-    try:
-        subprocess.run([
-            FFMPEG_PATH, '-f', 'lavfi',
-            '-i', f'aevalsrc={expr}:d=180:s=22050',
-            '-af', af,
-            path, '-y'
-        ], capture_output=True, timeout=30)
-
-        if os.path.exists(path):
-            MUSIC_CACHE[preset] = path
-            return path
-    except Exception as e:
-        print(f"[music error] {e}")
-    return None
 
 # ============================================================
 #  МАТ-ФИЛЬТР
@@ -406,7 +362,6 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
 
         tts_generate(text[:500], mp3_path, voice)
 
-        voice_filter = None
         if voice_key == "3":
             voice_filter = (
                 "aresample=44100,"
@@ -415,44 +370,18 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
                 "aecho=0.7:0.8:400:0.35,"
                 "aecho=0.6:0.7:900:0.25"
             )
-
-        music_preset = chat_music.get(chat_id, 0)
-        music_path = get_music_file(music_preset) if music_preset else None
-
-        if music_path and os.path.exists(music_path):
-            if voice_filter:
-                filter_complex = (
-                    f"[0:a]{voice_filter}[v];"
-                    "[1:a]volume=0.22[m];"
-                    "[v][m]amix=inputs=2:duration=first:dropout_transition=2[vout]"
-                )
-            else:
-                filter_complex = (
-                    "[0:a]volume=1.0[v];"
-                    "[1:a]volume=0.22[m];"
-                    "[v][m]amix=inputs=2:duration=first:dropout_transition=2[vout]"
-                )
             subprocess.run([
-                FFMPEG_PATH, '-i', mp3_path, '-i', music_path,
-                '-filter_complex', filter_complex,
-                '-map', '[vout]',
+                FFMPEG_PATH, '-i', mp3_path,
+                '-filter:a', voice_filter,
                 '-c:a', 'libopus', '-b:a', '64k',
                 ogg_path, '-y'
-            ], capture_output=True, timeout=90)
+            ], capture_output=True, timeout=60)
         else:
-            if voice_filter:
-                subprocess.run([
-                    FFMPEG_PATH, '-i', mp3_path,
-                    '-filter:a', voice_filter,
-                    '-c:a', 'libopus', '-b:a', '64k',
-                    ogg_path, '-y'
-                ], capture_output=True, timeout=60)
-            else:
-                subprocess.run([
-                    FFMPEG_PATH, '-i', mp3_path,
-                    '-c:a', 'libopus', '-b:a', '64k',
-                    ogg_path, '-y'
-                ], capture_output=True, timeout=60)
+            subprocess.run([
+                FFMPEG_PATH, '-i', mp3_path,
+                '-c:a', 'libopus', '-b:a', '64k',
+                ogg_path, '-y'
+            ], capture_output=True, timeout=60)
 
         with open(ogg_path, 'rb') as f:
             try:
@@ -472,25 +401,22 @@ def speak_text_in_chat(chat_id, text, user_id, reply_to_id=None, voice="ru-RU-Sv
             pass
 
 # ============================================================
-#  ИЗМЕНЕНИЕ ТОНА (улучшенное скачивание)
+#  ИЗМЕНЕНИЕ ТОНА
 # ============================================================
 
 def _download_telegram_file(file_id):
-    """Скачивает файл из Telegram с несколькими попытками и длинным таймаутом."""
     last_err = None
-
     for attempt in range(3):
         try:
             file_info = bot.get_file(file_id)
             url = f'https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}'
-
             for dl_attempt in range(3):
                 try:
                     r = requests.get(url, timeout=120, stream=True)
                     if r.status_code == 200:
                         content = r.content
                         if content and len(content) > 100:
-                            return content
+                            return content, None
                         last_err = f"Empty file ({len(content)} bytes)"
                     else:
                         last_err = f"HTTP {r.status_code}"
@@ -503,7 +429,6 @@ def _download_telegram_file(file_id):
             last_err = f"{type(e).__name__}: {str(e)[:120]}"
             print(f"[get_file attempt {attempt+1}] {last_err}")
             time.sleep(3)
-
     return None, last_err
 
 
@@ -545,28 +470,10 @@ def change_voice_pitch(message, semitones=4):
         y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
         sf.write(out_wav, y_shifted, sr)
 
-        chat_id = message.chat.id
-        music_preset = chat_music.get(chat_id, 0)
-        music_path = get_music_file(music_preset) if music_preset else None
-
-        if music_path and os.path.exists(music_path):
-            filter_complex = (
-                "[0:a]volume=1.0[v];"
-                "[1:a]volume=0.22[m];"
-                "[v][m]amix=inputs=2:duration=first:dropout_transition=2[vout]"
-            )
-            subprocess.run([
-                FFMPEG_PATH, '-i', out_wav, '-i', music_path,
-                '-filter_complex', filter_complex,
-                '-map', '[vout]',
-                '-c:a', 'libopus', '-b:a', '64k',
-                out_ogg, '-y'
-            ], capture_output=True, timeout=90)
-        else:
-            subprocess.run([
-                FFMPEG_PATH, '-i', out_wav,
-                '-c:a', 'libopus', '-b:a', '64k', out_ogg, '-y'
-            ], capture_output=True, timeout=60)
+        subprocess.run([
+            FFMPEG_PATH, '-i', out_wav,
+            '-c:a', 'libopus', '-b:a', '64k', out_ogg, '-y'
+        ], capture_output=True, timeout=60)
 
         with open(out_ogg, 'rb') as f:
             try:
@@ -692,14 +599,12 @@ def toggle_speak(message):
         speak_users[chat_id].add(user_id)
         cur = speak_voice.get(chat_id, "1")
         name = EDGE_VOICES[cur][1]
-        mus = chat_music.get(chat_id, 0)
-        mus_text = f"\n🎵 Музыка: {mus}" if mus else "\n🔇 Музыка выключена"
         bot.reply_to(
             message,
             f"🔊 Режим озвучки *включён*.\n"
-            f"Голос: *{name}*{mus_text}\n\n"
+            f"Голос: *{name}*\n\n"
             f"Смени голос: `/голос 1|2|3`\n"
-            f"Музыка: `/+муз1`, `/+муз2`, `/+муз3`",
+            f"Выключить: `/говор`",
             parse_mode="Markdown"
         )
 
@@ -717,57 +622,17 @@ def set_voice(message):
                 "Выбор голоса:\n"
                 "`/голос 1` — Светлана (женский)\n"
                 "`/голос 2` — Дмитрий (мужской)\n"
-                "`/голос 3` — 💀 Демон (страшный + музыка)",
+                "`/голос 3` — 💀 Демон (страшный)",
                 parse_mode="Markdown"
             )
             return
         chat_id = message.chat.id
         speak_voice[chat_id] = parts[1]
         vk = parts[1]
-
-        if vk == "3":
-            chat_music[chat_id] = 3
-            msg = (
-                f"🎙️ Голос: *{EDGE_VOICES[vk][1]}*\n"
-                f"🎵 Музыка включена автоматически (Тёмный хор)."
-            )
-        else:
-            chat_music[chat_id] = 0
-            msg = f"🎙️ Голос: *{EDGE_VOICES[vk][1]}*\n🔇 Музыка выключена."
-
-        bot.reply_to(message, msg, parse_mode="Markdown")
+        bot.reply_to(message, f"🎙️ Голос: *{EDGE_VOICES[vk][1]}*", parse_mode="Markdown")
     except Exception as e:
         print(f"[set voice error] {e}")
         bot.reply_to(message, "❌ Использование: `/голос 1|2|3`")
-
-# ============================================================
-#  МУЗЫКА
-# ============================================================
-
-@bot.message_handler(func=lambda m: m.text and m.text.strip().lower() in ('/+муз1', '/+муз2', '/+муз3'))
-def toggle_music(message):
-    if is_user_muted(message):
-        try: bot.delete_message(message.chat.id, message.message_id)
-        except Exception: pass
-        return
-    try:
-        preset = int(message.text.strip()[-1])
-        chat_id = message.chat.id
-        current = chat_music.get(chat_id, 0)
-        if current == preset:
-            chat_music[chat_id] = 0
-            bot.reply_to(message, f"🔇 Музыка {preset} выключена.")
-        else:
-            chat_music[chat_id] = preset
-            names = {1: "Зловещий орган", 2: "Тревожная мелодия", 3: "Тёмный хор"}
-            bot.reply_to(
-                message,
-                f"🎵 *Музыка {preset}* ({names[preset]}) включена.\n"
-                f"Работает в `/говор` и `/voice`.",
-                parse_mode="Markdown"
-            )
-    except Exception as e:
-        print(f"[music toggle error] {e}")
 
 # ============================================================
 #  БАНАН
@@ -942,7 +807,6 @@ def is_moderation_command(message):
         or command.startswith("/голос")
         or command.startswith("/банан")
         or command.startswith("/антибананан")
-        or command in ("/+муз1", "/+муз2", "/+муз3")
     )
 
 def set_manual_ban(message, duration_minutes):
@@ -1365,4 +1229,4 @@ if __name__ == "__main__":
     ping_thread.start()
 
     print("Бот запущен...")
-    run_bot() должен
+    run_bot()
