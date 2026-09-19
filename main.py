@@ -919,20 +919,33 @@ def _find_ffmpeg():
 
     return None
 
-FFMPEG_PATH = _find_ffmpeg() or "ffmpeg"
-print(f"[ffmpeg] итоговый путь: {FFMPEG_PATH}")
+# ============================================================
+#  ТЯЖЁЛАЯ ЗАГРУЗКА (ffmpeg + librosa) В ФОНЕ,
+#  чтобы бот отвечал на команды сразу после старта
+# ============================================================
+LIBROSA_OK = False
+librosa = None
+sf = None
 
-# ============================================================
-#  LIBROSA
-# ============================================================
-try:
-    import librosa
-    import soundfile as sf
-    LIBROSA_OK = True
-    print("[librosa] OK")
-except Exception as e:
-    LIBROSA_OK = False
-    print(f"[librosa] не загрузилась: {e}")
+def _init_heavy():
+    global FFMPEG_PATH, LIBROSA_OK, librosa, sf
+    try:
+        FFMPEG_PATH = _find_ffmpeg() or "ffmpeg"
+        print(f"[ffmpeg] итоговый путь: {FFMPEG_PATH}")
+    except Exception as e:
+        print(f"[ffmpeg] ошибка поиска: {e}")
+    try:
+        import librosa as _librosa
+        import soundfile as _sf
+        librosa = _librosa
+        sf = _sf
+        LIBROSA_OK = True
+        print("[librosa] OK")
+    except Exception as e:
+        LIBROSA_OK = False
+        print(f"[librosa] не загрузилась: {e}")
+
+threading.Thread(target=_init_heavy, daemon=True).start()
 
 # ============================================================
 #  OPENROUTER
@@ -955,6 +968,17 @@ def _safe_reply_to(message, text, **kwargs):
             return None
 
 bot.reply_to = _safe_reply_to
+
+def _log_updates(messages):
+    for m in messages:
+        try:
+            txt = m.text or ""
+            info = txt.split()[0][:30] if txt.startswith("/") else m.content_type
+            print(f"[msg] chat={m.chat.id} user={m.from_user.id} {info}")
+        except Exception:
+            pass
+
+bot.set_update_listener(_log_updates)
 
 # ============================================================
 #  СОСТОЯНИЕ
@@ -1097,21 +1121,4 @@ def get_bot_identity_reply(text):
     normalized = (text or "").lower().replace("ё", "е")
     normalized = re.sub(r"[?!.,:;«»\"']", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
-    if (re.search(r"\bкак зовут\b", normalized)
-            or re.search(r"\bполное имя\b", normalized)
-            or re.search(r"\bкак тебя зовут\b", normalized)):
-        return "Моё полное имя — Жилимаша, а сокращённо меня зовут Маша."
-    if (re.search(r"\bгде (ты )?жив", normalized)
-            or re.search(r"\bоткуда ты\b", normalized)
-            or re.search(r"\bв какой стране\b", normalized)):
-        return "Я живу в России."
-    if (re.search(r"\bкто (твой )?(хозяин|создатель|автор)\b", normalized)
-            or re.search(r"\bкто тебя создал\b", normalized)
-            or re.search(r"\bкто тебя придумал\b", normalized)):
-        return "Мой создатель — крутой Макс."
-    return None
-
-def limit_sentences(text, n=3):
-    parts = re.findall(r'[^.!?…]+[.!?…]+', text)
-    if not parts:
-        re
+    if (re.search(r"\bкак зовут\b",
